@@ -2,36 +2,13 @@
 """
 Graph Foundation Model for Particle Physics Edge Classification
 
-FULLY INTEGRATED & OPTIMIZED VERSION with:
-- Multiple architectures (GCN, GAT, Graph Transformer, GraphSAGE)
-- Intelligent loss functions (CrossEntropy, Focal, Weighted)
-- Feature selection (--baseline: 3 features, --all-features: 42+ features)
-- Proper file outputs (PKL for metrics, Parquet for predictions)
-- VECTORIZED OPERATIONS for 3-5x faster training
-- Single GPU or multi-GPU training
-
-Usage examples:
-    # Train GCN baseline
-    python3 new_RunningMultipleModels.py --model gcn --baseline --gpu 0
-    
-    # Train Graph Transformer with all features
-    python3 new_RunningMultipleModels.py --model transformer --all-features --gpu 1
-    
-    # Train GAT with focal loss
-    python3 new_RunningMultipleModels.py --model gat --weighted-loss --weight-strategy focal --gpu 2
-    
-    # Train all architectures sequentially
-    python3 new_RunningMultipleModels.py --model all --epochs 30 --gpu 0
-    
-    # Convert old pickle results
-    python3 new_RunningMultipleModels.py convert path/to/results.pkl
+CUDA/LINUX VERSION - FULLY INTEGRATED & OPTIMIZED
 """
 
 # ============================================================================
 # IMPORTS
 # ============================================================================
 
-# Standard Library
 import argparse
 import datetime
 import gc
@@ -39,6 +16,7 @@ import glob
 import json
 import os
 import pickle
+import psutil
 import re
 import signal
 import sys
@@ -46,7 +24,6 @@ import time
 import traceback
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-# Third-Party Libraries
 import numpy as np
 import pandas as pd
 import torch
@@ -56,17 +33,13 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, IterableDataset
 
-# PyTorch Geometric
 import torch_geometric
 from torch_geometric.nn import GCNConv, GATConv, SAGEConv, TransformerConv
 from torch_geometric.nn import BatchNorm, LayerNorm
 from torch.nn import BatchNorm1d, LayerNorm as LayerNorm1d
 
-# Parquet support
 import pyarrow as pa
 import pyarrow.parquet as pq
-
-# HDF5 support
 import h5py
 
 try:
@@ -80,1294 +53,1512 @@ except ImportError:
     DEBUG_AVAILABLE = False
     def debug_print(*args, **kwargs): pass
 
-# ============================================================================
-# GLOBAL SETUP
-# ============================================================================
-
-# Set multiprocessing start method to 'spawn' (required for CUDA on some systems)
-if mp.get_start_method(allow_none=True) != 'spawn':
-    mp.set_start_method('spawn', force=True)
-
-# Enable cuDNN auto-tuning for faster GPU operations
-torch.backends.cudnn.benchmark = True
-
-# Limit CPU threads (slightly increased for better performance)
-torch.set_num_threads(4)
-
-
-# ============================================================================
-# ARGPARSE CONFIGURATION
-# ============================================================================
-
-def parse_args():
-    """Parse command line arguments for flexible model configuration."""
-    parser = argparse.ArgumentParser(
-        description='Graph Foundation Model for Particle Physics Edge Classification',
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    
-    # Model architecture
-    parser.add_argument('--model', '-m', type=str, default='gcn',
-                        choices=['gcn', 'gat', 'transformer', 'sage', 'all'],
-                        help='Backbone architecture. Use "all" to train all architectures sequentially')
-    parser.add_argument('--hidden-dim', type=int, default=128,
-                        help='Hidden dimension')
-    parser.add_argument('--layers', '-l', type=int, default=6,
-                        help='Number of backbone layers')
-    parser.add_argument('--heads', type=int, default=2,
-                        help='Number of attention heads (for GAT and Transformer)')
-    parser.add_argument('--dropout', type=float, default=0.0,
-                        help='Dropout rate')
-    parser.add_argument('--layer-weights', action='store_true',
-                        help='Use learnable layer weights')
-    parser.add_argument('--softmax-weights', action='store_true',
-                        help='Apply softmax to layer weights')
-    
-    # Normalization
-    parser.add_argument('--norm', type=str, default='batch',
-                        choices=['batch', 'layer', 'none'],
-                        help='Normalization type')
-    
-    # Feature configuration
-    parser.add_argument('--baseline', action='store_true', default=True,
-                        help='Use baseline features only (SNR, eta, phi) - 3 features')
-    parser.add_argument('--all-features', action='store_true',
-                        help='Use all 42+ features from dataset')
-    
-    # Training configuration
-    parser.add_argument('--epochs', '-e', type=int, default=30,
-                        help='Number of epochs')
-    parser.add_argument('--batch-size', '-b', type=int, default=1,
-                        help='Batch size (events per batch)')
-    parser.add_argument('--lr', type=float, default=1e-3,
-                        help='Learning rate')
-    parser.add_argument('--weight-decay', type=float, default=5e-4,
-                        help='Weight decay')
-    parser.add_argument('--patience', type=int, default=10,
-                        help='Early stopping patience')
-    
-    # Loss weighting
-    parser.add_argument('--weighted-loss', action='store_true',
-                        help='Use weighted loss for class imbalance')
-    parser.add_argument('--weight-strategy', type=str, default='inverse',
-                        choices=['inverse', 'focal', 'logarithmic', 'manual'],
-                        help='Class weighting strategy')
-    parser.add_argument('--focal-alpha', type=float, default=0.25,
-                        help='Alpha parameter for focal loss')
-    parser.add_argument('--focal-gamma', type=float, default=2.0,
-                        help='Gamma parameter for focal loss')
-    
-    # Data split
-    parser.add_argument('--train-ratio', type=float, default=0.7,
-                        help='Train/test split ratio')
-    
-    # Hardware
-    parser.add_argument('--gpu', '-g', type=int, default=0,
-                        help='GPU ID to use (-1 for CPU)')
-    parser.add_argument('--mixed-precision', action='store_true', default=True,
-                        help='Enable mixed precision training (default: True)')
-    parser.add_argument('--no-mixed-precision', action='store_false', dest='mixed_precision',
-                        help='Disable mixed precision training')
-
-    # Experiment tracking
-    parser.add_argument('--save-dir', type=str, default='/storage/mxg1065/foundation_experiments',
-                        help='Directory to save models')
-    parser.add_argument('--exp-name', type=str, default=None,
-                        help='Experiment name (auto-generated if not provided)')
-    parser.add_argument('--data-dir', type=str, default='/storage/mxg1065/datafiles',
-                        help='Data directory')
-    parser.add_argument('--resume', action='store_true', default=True,
-                        help='Resume from checkpoint if available')
-    parser.add_argument('--debug', action='store_true',
-                        help='Debug mode (only runs a few events)')
-    parser.add_argument('--inference-only', action='store_true',  # NEW FLAG
-                        help='Skip training, only run inference on best model and save results') 
-    return parser.parse_args()
 
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
 
 def log(msg: str) -> None:
-    """Simple timestamped logger."""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now}] {msg}", flush=True)
 
 
+# ============================================================================
+# GLOBAL SETUP
+# ============================================================================
+
+if mp.get_start_method(allow_none=True) != 'spawn':
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+
+torch.backends.cudnn.benchmark = True
+torch.set_num_threads(4)
+
+
+# ============================================================================
+# RESOURCE TRACKER CLASS
+# ============================================================================
+
+class ResourceTracker:
+    """Tracks runtime, memory, CPU, and optional GPU usage during execution."""
+
+    def __init__(self, log_dir: str = None, enabled: bool = True):
+        # Enable/disable resource tracking entirely.
+        self.enabled = enabled
+
+        # Directory where resource reports will be written.
+        self.log_dir = log_dir or './resource_logs'
+
+        # Create the logging directory if tracking is enabled.
+        if self.enabled:
+            os.makedirs(self.log_dir, exist_ok=True)
+
+        # Store all measurements collected during execution.
+        self.measurements = []
+
+        # psutil process object for querying resource usage.
+        self.process = psutil.Process() if self.enabled else None
+
+        # Baseline measurements recorded when start() is called.
+        self.start_time = None
+        self.start_memory = None
+        self.start_gpu_memory = None
+
+    def start(self):
+        """Record baseline resource usage before execution begins."""
+        if not self.enabled:
+            return
+
+        # Start timing.
+        self.start_time = time.perf_counter()
+
+        # Record initial RAM usage (GB).
+        self.start_memory = self.process.memory_info().rss / 1024**3
+
+        # Record initial GPU memory usage if CUDA is available.
+        if torch.cuda.is_available():
+            self.start_gpu_memory = torch.cuda.memory_allocated() / 1024**3
+
+    def measure(self, stage: str) -> Optional[Dict]:
+        """
+        Record the current resource usage.
+
+        Parameters
+        ----------
+        stage : str
+            Descriptive name of the current execution stage.
+        """
+        if not self.enabled:
+            return None
+
+        # Current RAM usage (GB).
+        mem = self.process.memory_info().rss / 1024**3
+
+        # Elapsed wall-clock time since start().
+        elapsed = time.perf_counter() - self.start_time
+
+        # Store the primary measurements.
+        measurement = {
+            'stage': stage,
+            'timestamp': datetime.datetime.now().isoformat(),
+            'time_elapsed': elapsed,
+            'memory_gb': mem,
+            'memory_delta_gb': mem - self.start_memory,
+        }
+
+        # Record GPU memory statistics if CUDA is being used.
+        if torch.cuda.is_available():
+            measurement['gpu_memory_gb'] = torch.cuda.memory_allocated() / 1024**3
+            measurement['gpu_memory_delta_gb'] = (
+                measurement['gpu_memory_gb'] - self.start_gpu_memory
+            )
+            measurement['gpu_memory_type'] = 'cuda'
+
+        # Collect additional process statistics when available.
+        try:
+            measurement['cpu_percent'] = self.process.cpu_percent()
+
+            io_counters = self.process.io_counters()
+            measurement['disk_read_gb'] = io_counters.read_bytes / 1024**3
+            measurement['disk_write_gb'] = io_counters.write_bytes / 1024**3
+
+        # Some platforms do not expose all process statistics.
+        except:
+            pass
+
+        # Save the measurement for later reporting.
+        self.measurements.append(measurement)
+
+        return measurement
+
+    def log_measurement(self, stage: str, extra_info: str = ""):
+        """
+        Measure the current resource usage and print a concise summary.
+        """
+        m = self.measure(stage)
+
+        if m:
+            gpu_str = (
+                f" | GPU: {m['gpu_memory_gb']:.2f}GB"
+                if 'gpu_memory_gb' in m else ""
+            )
+
+            log(
+                f"  📊 [{stage}] "
+                f"Time: {m['time_elapsed']:.1f}s | "
+                f"RAM: {m['memory_gb']:.2f}GB "
+                f"(Δ{m['memory_delta_gb']:+.2f})"
+                f"{gpu_str}"
+                + (f" | {extra_info}" if extra_info else "")
+            )
+
+        return m
+
+    def save_report(self, filename: str = "resource_report.json"):
+        """Save all recorded measurements to a JSON report."""
+        if not self.enabled or not self.measurements:
+            return
+
+        filepath = os.path.join(self.log_dir, filename)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+        with open(filepath, 'w') as f:
+            json.dump(self.measurements, f, indent=2, default=str)
+
+        log(f"📊 Resource report saved to: {filepath}")
+
+    def print_summary(self):
+        """Print a summary of the overall resource usage."""
+        if not self.enabled or not self.measurements:
+            return
+
+        # Total runtime corresponds to the last recorded measurement.
+        total_time = self.measurements[-1]['time_elapsed']
+
+        # Peak RAM usage across all measurements.
+        peak_memory = max(m['memory_gb'] for m in self.measurements)
+
+        log(f"\n📊 RESOURCE USAGE SUMMARY:")
+        log(f"   Total time: {total_time:.1f}s ({total_time/60:.1f} min)")
+        log(f"   Peak RAM: {peak_memory:.2f} GB")
+
+# ============================================================================
+# ARGPARSE CONFIGURATION
+# ============================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Graph Foundation Model for Particle Physics Edge Classification')
+    parser.add_argument('--model', '-m', type=str, default='gcn', choices=['gcn', 'gat', 'transformer', 'sage', 'all'])
+    parser.add_argument('--hidden-dim', type=int, default=128)
+    parser.add_argument('--layers', '-l', type=int, default=6)
+    parser.add_argument('--heads', type=int, default=2)
+    parser.add_argument('--dropout', type=float, default=0.0)
+    parser.add_argument('--layer-weights', action='store_true')
+    parser.add_argument('--softmax-weights', action='store_true')
+    parser.add_argument('--norm', type=str, default='batch', choices=['batch', 'layer', 'none'])
+    parser.add_argument('--baseline', action='store_true', default=True)
+    parser.add_argument('--all-features', action='store_true')
+    parser.add_argument('--epochs', '-e', type=int, default=30)
+    parser.add_argument('--batch-size', '-b', type=int, default=1)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--weight-decay', type=float, default=5e-4)
+    parser.add_argument('--patience', type=int, default=10)
+    parser.add_argument('--weighted-loss', action='store_true')
+    parser.add_argument('--weight-strategy', type=str, default='inverse', choices=['inverse', 'focal', 'logarithmic', 'manual'])
+    parser.add_argument('--focal-alpha', type=float, default=0.25)
+    parser.add_argument('--focal-gamma', type=float, default=2.0)
+    parser.add_argument('--train-ratio', type=float, default=0.7)
+    parser.add_argument('--gpu', '-g', type=int, default=0)
+    parser.add_argument('--mixed-precision', action='store_true', default=True)
+    parser.add_argument('--no-mixed-precision', action='store_false', dest='mixed_precision')
+    parser.add_argument('--save-dir', type=str, default='./experiments')
+    parser.add_argument('--exp-name', type=str, default=None)
+    parser.add_argument('--data-dir', type=str, default='./data')
+    parser.add_argument('--resume', action='store_true', default=True)
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--inference-only', action='store_true')
+    parser.add_argument('--analyze-scalability', action='store_true')
+    parser.add_argument('--track-resources', action='store_true', default=True)
+    parser.add_argument('--no-track-resources', action='store_false', dest='track_resources')
+    return parser.parse_args()
+
+
+# ============================================================================
+# UTILITY FUNCTIONS (continued)
+# ============================================================================
+
 def save_pickle(data: Any, filepath: str) -> None:
-    """Save data to pickle file."""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, 'wb') as f:
         pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-
 def load_pickle(filepath: str) -> Any:
-    """Load data from pickle file."""
     with open(filepath, 'rb') as f:
         return pickle.load(f)
 
-
 def find_latest_checkpoint(save_dir: str, base_name: str) -> Optional[Tuple[int, str]]:
-    """Find the newest model checkpoint in a directory."""
     pattern = re.compile(f"{re.escape(os.path.splitext(base_name)[0])}_epoch(\\d+).pt")
     checkpoints = []
-    
     for fname in os.listdir(save_dir):
         match = pattern.match(fname)
         if match:
-            epoch = int(match.group(1))
-            checkpoints.append((epoch, os.path.join(save_dir, fname)))
-    
+            checkpoints.append((int(match.group(1)), os.path.join(save_dir, fname)))
     return max(checkpoints, key=lambda x: x[0]) if checkpoints else None
 
+def analyze_dataset_scalability(data_dir: str) -> Dict:
+    log(f"\n📊 ANALYZING DATASET SCALABILITY: {data_dir}")
+    log("="*70)
+    results = {'directory': data_dir, 'files': {}, 'scalability': {}}
+    all_files = glob.glob(os.path.join(data_dir, "*"))
+    total_size_gb = 0
+    for filepath in all_files:
+        if os.path.isfile(filepath):
+            filename = os.path.basename(filepath)
+            size_gb = os.path.getsize(filepath) / 1024**3
+            total_size_gb += size_gb
+            if 'events_' in filename and filename.endswith('.h5'):
+                file_type = 'event_data'
+            elif 'labels_' in filename and filename.endswith('.npy'):
+                file_type = 'labels'
+            elif 'pairs_' in filename and filename.endswith('.npy'):
+                file_type = 'pairs'
+            elif 'cells_' in filename and filename.endswith('.npy'):
+                file_type = 'cells'
+            elif filename.endswith('.json'):
+                file_type = 'metadata'
+            elif filename.endswith('.pkl'):
+                file_type = 'scaler'
+            else:
+                file_type = 'other'
+            if file_type not in results['files']:
+                results['files'][file_type] = {'count': 0, 'total_size_gb': 0, 'files': []}
+            results['files'][file_type]['count'] += 1
+            results['files'][file_type]['total_size_gb'] += size_gb
+            results['files'][file_type]['files'].append({'name': filename, 'size_gb': size_gb})
+    
+    total_events = None
+    metadata_files = glob.glob(os.path.join(data_dir, "metadata_*.json"))
+    if metadata_files:
+        with open(metadata_files[0], 'r') as f:
+            total_events = json.load(f).get('total_events')
+    if not total_events:
+        label_files = sorted(glob.glob(os.path.join(data_dir, "labels_*.npy")))
+        if label_files:
+            total_events = sum(np.lib.format.read_array_header_1_0(np.lib.format.read_magic(open(lf,'rb')))[0][0] for lf in label_files)
+    
+    if total_events:
+        results['scalability']['total_events'] = total_events
+        for scale in [10_000, 50_000, 100_000, 500_000, 1_000_000]:
+            total_gb_scaled = sum(info['total_size_gb'] / total_events * scale for info in results['files'].values() if info['count'] > 0)
+            results['scalability'][f'{scale}_events_gb'] = total_gb_scaled
+    
+    log(f"\n📁 FILE BREAKDOWN: Total {total_size_gb:.2f} GB")
+    for file_type, info in sorted(results['files'].items()):
+        log(f"   {file_type:<15s}: {info['count']:3d} files, {info['total_size_gb']:8.2f} GB")
+    if 'scalability' in results:
+        log(f"\n📈 SCALABILITY:")
+        for scale in [10_000, 50_000, 100_000, 500_000, 1_000_000]:
+            if f'{scale}_events_gb' in results['scalability']:
+                log(f"   {scale:,} events: {results['scalability'][f'{scale}_events_gb']:.1f} GB")
+    return results
 
 # ============================================================================
-# FEATURE LOADING WITH SELECTION (BASELINE vs ALL FEATURES)
+# FEATURE LOADING
 # ============================================================================
 
-def load_features_with_selection(data_dir: str, args) -> Tuple:
-    """
-    Load features based on --baseline or --all-features flag.
+def load_features_with_selection(data_dir: str, args, tracker: Optional[ResourceTracker] = None) -> Tuple:
+    log(f"📊 Loading features: {'ALL FEATURES (42+)' if args.all_features else 'BASELINE (3 features)'}")
+    log(f"📁 Data directory: {data_dir}")
+    if tracker:
+        tracker.log_measurement("start_loading")
     
-    Returns:
-        features_dict: Dict mapping event_id -> feature array (num_cells, num_features)
-        unscaled_dict: Dict mapping event_id -> unscaled feature array
-        pairs: Edge connectivity array (num_edges, 2)
-        labels: Edge labels array (num_events, num_edges)
-        cluster_info: Dict mapping event_id -> cluster information
-        input_dim: Number of input features
-        feature_names: List of feature names
-    """
-    log(f"📊 Loading features with mode: {'BASELINE (3 features)' if args.baseline else 'ALL FEATURES (42+)'}")
+    cells_files = sorted(glob.glob(os.path.join(data_dir, "cells_*.npy")))
+    pairs_files = sorted(glob.glob(os.path.join(data_dir, "pairs_*.npy")))
+    event_files = sorted(glob.glob(os.path.join(data_dir, "events_*.h5")))
+    label_files = sorted(glob.glob(os.path.join(data_dir, "labels_*.npy")))
+    metadata_files = glob.glob(os.path.join(data_dir, "metadata_*.json"))
     
-    # Load static cell features
-    cells_path = os.path.join(data_dir, "cells.npy")
-    cells = np.load(cells_path)
-    num_cells = cells.shape[0]
-    log(f"  ✓ Loaded {num_cells} cells from cells.npy")
+    if not event_files:
+        old = os.path.join(data_dir, "events.h5")
+        if os.path.exists(old): event_files = [old]
+    if not label_files:
+        old = os.path.join(data_dir, "labels.npy")
+        if os.path.exists(old): label_files = [old]
+    if not cells_files: cells_files = [os.path.join(data_dir, "cells.npy")]
+    if not pairs_files: pairs_files = [os.path.join(data_dir, "pairs.npy")]
     
-    # Load edge connectivity
-    pairs_path = os.path.join(data_dir, "pairs.npy")
-    pairs = np.load(pairs_path).astype(np.int32)
-    num_edges = pairs.shape[0]
-    log(f"  ✓ Loaded {num_edges} edges from pairs.npy")
+    log(f"\n📂 FILES: {len(cells_files)} cells, {len(pairs_files)} pairs, {len(event_files)} events, {len(label_files)} labels")
+    total_size_gb = sum(os.path.getsize(f)/1024**3 for f in cells_files+pairs_files+event_files+label_files if os.path.exists(f))
+    log(f"   Total: {total_size_gb:.2f} GB")
     
-    # Load events HDF5
-    events_path = os.path.join(data_dir, "events.h5")
-    log(f"  Loading HDF5: {events_path}")
+    metadata = {}
+    if metadata_files:
+        with open(metadata_files[0], 'r') as f: metadata = json.load(f)
     
-    with h5py.File(events_path, 'r') as h5f:
-        # Determine num_events from dataset shape (attribute not present in this HDF5)
-        if 'cell/snr_computed' in h5f:
-            num_events = h5f['cell/snr_computed'].shape[0]
-        elif 'cell/energy_raw' in h5f:
-            num_events = h5f['cell/energy_raw'].shape[0]
-        elif 'cell/snr_raw' in h5f:
-            num_events = h5f['cell/snr_raw'].shape[0]
-        else:
-            num_events = 1000  # fallback
-        log(f"  Found {num_events} events")
-            
-        if args.baseline:
-            # ================================================================
-            # BASELINE MODE: Only SNR, eta, phi (3 features)
-            # ================================================================
-            
-            # Load SNR
-            if 'cell/snr_computed' in h5f:
-                snr = h5f['cell/snr_computed'][:]
-                log("  ✓ Using computed SNR (energy/noise)")
-            elif 'cell/snr_raw' in h5f:
-                snr = h5f['cell/snr_raw'][:]
-                log("  ✓ Using raw SNR from ROOT")
-            elif 'cell/energy_raw' in h5f and 'cell/noise_raw' in h5f:
-                energy = h5f['cell/energy_raw'][:]
-                noise = h5f['cell/noise_raw'][:]
-                noise = np.where(noise == 0, 1e-6, noise)
-                snr = energy / noise
-                log("  ✓ Computed SNR from energy/noise")
-            else:
-                raise ValueError("No SNR or energy/noise data found in events.h5")
-            
-            # Load geometry
-            if 'cell/cell_eta' in h5f and 'cell/cell_phi' in h5f:
-                eta = h5f['cell/cell_eta'][:]
-                phi = h5f['cell/cell_phi'][:]
-                log("  ✓ Loaded eta/phi from events.h5")
-            else:
-                # Use static geometry from cells.npy
-                eta = np.tile(cells['eta_event0'].astype(np.float32), (num_events, 1))
-                phi = np.tile(cells['phi_event0'].astype(np.float32), (num_events, 1))
-                log("  ⚠️  Using eta/phi from cells.npy")
-            
-            # Build feature dict: 3 features per cell
-            features_dict = {}
-            unscaled_dict = {}
-            
-            for ev in range(num_events):
-                features = np.stack([
-                    snr[ev],
-                    eta[ev],
-                    phi[ev]
-                ], axis=1).astype(np.float32)
-                
-                features_dict[ev] = features
-                unscaled_dict[ev] = features.copy()  # Baseline uses same for scaled/unscaled
-                
-                if args.debug and ev % 100 == 0 and ev > 0:
-                    log(f"    Processed {ev}/{num_events} events")
-            
-            input_dim = 3
-            feature_names = ['snr', 'eta', 'phi']
-            
-        else:
-            # ================================================================
-            # ALL FEATURES MODE: Comprehensive feature set (42+ features)
-            # ================================================================
-            
-            feature_list = []
-            feature_names = []
-            
-            # ----------------------------------------------------------------
-            # 1. ENERGY/SNR FEATURES (2-3 features)
-            # ----------------------------------------------------------------
-            
-            # SNR (computed or raw)
-            if 'cell/snr_computed' in h5f:
-                snr = h5f['cell/snr_computed'][:]
-                feature_list.append(snr)
-                feature_names.append('snr_computed')
-                log("  ✓ Added: snr_computed")
-            elif 'cell/snr_raw' in h5f:
-                snr = h5f['cell/snr_raw'][:]
-                feature_list.append(snr)
-                feature_names.append('snr_raw')
-                log("  ✓ Added: snr_raw")
-            
-            # Raw energy
-            if 'cell/energy_raw' in h5f:
-                energy = h5f['cell/energy_raw'][:]
-                feature_list.append(energy)
-                feature_names.append('energy_raw')
-                log("  ✓ Added: energy_raw")
-            
-            # Raw noise
-            if 'cell/noise_raw' in h5f:
-                noise_raw = h5f['cell/noise_raw'][:]
-                feature_list.append(noise_raw)
-                feature_names.append('noise_raw')
-                log("  ✓ Added: noise_raw")
-            
-            # ----------------------------------------------------------------
-            # 2. GEOMETRY FEATURES (2-5 features)
-            # ----------------------------------------------------------------
-            
-            if 'cell/cell_eta' in h5f and 'cell/cell_phi' in h5f:
-                eta = h5f['cell/cell_eta'][:]
-                phi = h5f['cell/cell_phi'][:]
-            else:
-                eta = np.tile(cells['eta_event0'].astype(np.float32), (num_events, 1))
-                phi = np.tile(cells['phi_event0'].astype(np.float32), (num_events, 1))
-            
-            feature_list.extend([eta, phi])
-            feature_names.extend(['eta', 'phi'])
-            log("  ✓ Added: eta, phi")
-            
-            # Geometry derivatives from cells.npy
-            if 'deta' in cells.dtype.names:
-                deta = np.tile(cells['deta'].astype(np.float32), (num_events, 1))
-                feature_list.append(deta)
-                feature_names.append('deta')
-                log("  ✓ Added: deta")
-            
-            if 'dphi' in cells.dtype.names:
-                dphi = np.tile(cells['dphi'].astype(np.float32), (num_events, 1))
-                feature_list.append(dphi)
-                feature_names.append('dphi')
-                log("  ✓ Added: dphi")
-            
-            if 'volume' in cells.dtype.names:
-                volume = np.tile(cells['volume'].astype(np.float32), (num_events, 1))
-                feature_list.append(volume)
-                feature_names.append('volume')
-                log("  ✓ Added: volume")
-            
-            # ----------------------------------------------------------------
-            # 3. NOISE STATISTICS (4 features) - VERY VALUABLE!
-            # ----------------------------------------------------------------
-            
-            if 'noise_mean' in cells.dtype.names:
-                noise_mean = np.tile(cells['noise_mean'].astype(np.float32), (num_events, 1))
-                feature_list.append(noise_mean)
-                feature_names.append('noise_mean')
-                log("  ✓ Added: noise_mean")
-            
-            if 'noise_std' in cells.dtype.names:
-                noise_std = np.tile(cells['noise_std'].astype(np.float32), (num_events, 1))
-                feature_list.append(noise_std)
-                feature_names.append('noise_std')
-                log("  ✓ Added: noise_std")
-            
-            if 'noise_count' in cells.dtype.names:
-                noise_count = np.tile(cells['noise_count'].astype(np.float32), (num_events, 1))
-                feature_list.append(noise_count)
-                feature_names.append('noise_count')
-                log("  ✓ Added: noise_count")
-            
-            if 'noise_category' in cells.dtype.names:
-                noise_category = np.tile(cells['noise_category'].astype(np.float32), (num_events, 1))
-                feature_list.append(noise_category)
-                feature_names.append('noise_category')
-                log("  ✓ Added: noise_category")
-            
-            # ----------------------------------------------------------------
-            # 4. TOPOLOGY FEATURES
-            # ----------------------------------------------------------------
-            
-            if 'num_neighbors' in cells.dtype.names:
-                num_neighbors = np.tile(cells['num_neighbors'].astype(np.float32), (num_events, 1))
-                feature_list.append(num_neighbors)
-                feature_names.append('num_neighbors')
-                log("  ✓ Added: num_neighbors")
-            
-            # ----------------------------------------------------------------
-            # 5. DETECTOR INFO (one-hot encoded)
-            # ----------------------------------------------------------------
-            
-            if 'subcalo' in cells.dtype.names:
-                subcalo = cells['subcalo'].astype(np.int32)
-                # One-hot encode (assuming 0-3 values)
-                num_subcalo = max(4, subcalo.max() + 1)
-                for i in range(num_subcalo):
-                    onehot = np.tile((subcalo == i).astype(np.float32), (num_events, 1))
-                    feature_list.append(onehot)
-                    feature_names.append(f'subcalo_{i}')
-                log(f"  ✓ Added: subcalo one-hot ({num_subcalo} classes)")
-            
-            if 'sampling' in cells.dtype.names:
-                sampling = cells['sampling'].astype(np.int32)
-                # One-hot encode (assuming 0-2 values)
-                num_sampling = max(3, sampling.max() + 1)
-                for i in range(num_sampling):
-                    onehot = np.tile((sampling == i).astype(np.float32), (num_events, 1))
-                    feature_list.append(onehot)
-                    feature_names.append(f'sampling_{i}')
-                log(f"  ✓ Added: sampling one-hot ({num_sampling} classes)")
-            
-            # ----------------------------------------------------------------
-            # 6. CLUSTER FEATURES
-            # ----------------------------------------------------------------
-            
-            if 'cell/cell_cluster_index' in h5f:
-                cluster_idx = h5f['cell/cell_cluster_index'][:]
-                
-                # Cluster membership flag
-                in_cluster = (cluster_idx >= 0).astype(np.float32)
-                feature_list.append(in_cluster)
-                feature_names.append('in_cluster')
-                log("  ✓ Added: in_cluster")
-                
-                # Cluster ID (normalized)
-                max_cluster = max(1, cluster_idx.max())
-                cluster_id_norm = cluster_idx.astype(np.float32) / max_cluster
-                feature_list.append(cluster_id_norm)
-                feature_names.append('cluster_id_norm')
-                log("  ✓ Added: cluster_id_norm")
-            
-            # ----------------------------------------------------------------
-            # 7. ADDITIONAL BRANCHES from events.h5
-            # ----------------------------------------------------------------
-            
-            if 'cell' in h5f:
-                cell_group = h5f['cell']
-                skip_keys = {
-                    'cell_SNR_scaled', 'cell_SNR_raw', 'snr_computed', 'snr_raw',
-                    'cell_eta', 'cell_phi', 'energy_raw', 'noise_raw',
-                    'cell_cluster_index', 'cell_to_cluster_eta', 'cell_to_cluster_phi'
-                }
-                
-                for key in cell_group.keys():
-                    if key in skip_keys:
-                        continue
-                    
-                    try:
-                        data = cell_group[key][:]
-                        if data.ndim == 2 and data.shape[0] == num_events:
-                            feature_list.append(data.astype(np.float32))
-                            feature_names.append(key)
-                            log(f"  ✓ Added: {key}")
-                    except Exception as e:
-                        log(f"  ⚠️  Skipped {key}: {str(e)[:50]}")
-            
-            # Build feature dict
-            features_dict = {}
-            unscaled_dict = {}
-            
-            for ev in range(num_events):
-                event_features = []
-                for feat in feature_list:
-                    if feat.ndim == 2 and feat.shape[0] == num_events:
-                        event_features.append(feat[ev])
-                    else:
-                        event_features.append(feat)
-                
-                features = np.stack(event_features, axis=1).astype(np.float32)
-                features_dict[ev] = features
-                unscaled_dict[ev] = features.copy()
-                
-                if args.debug and ev % 100 == 0 and ev > 0:
-                    log(f"    Processed {ev}/{num_events} events")
-            
-            input_dim = len(feature_names)
-        
-        # Load cluster info
-        cluster_info = {}
-        if 'cell/cell_cluster_index' in h5f:
-            cluster_idx = h5f['cell/cell_cluster_index'][:]
-            for ev in range(num_events):
-                cluster_info[ev] = {'cell_cluster_index': cluster_idx[ev].astype(np.int32)}
-        
-        # Load labels
-        labels_path = os.path.join(data_dir, "labels.npy")
-        labels = np.load(labels_path).astype(np.int8)
-        log(f"  ✓ Loaded labels: {labels.shape}")
+    cells = np.load(cells_files[0]); num_cells = cells.shape[0]
+    log(f"  ✓ Cells: {num_cells} ({cells.nbytes/1024**2:.1f} MB)")
+    pairs = np.load(pairs_files[0]).astype(np.int32); num_edges = pairs.shape[0]
+    log(f"  ✓ Pairs: {num_edges} ({pairs.nbytes/1024**2:.1f} MB)")
+    if tracker: tracker.log_measurement("static_files_loaded")
     
-    # Verify
-    log("\n✅ DATASET VERIFICATION:")
-    log(f"   Events: {num_events}")
-    log(f"   Cells: {num_cells}")
-    log(f"   Edges: {num_edges}")
-    log(f"   Labels shape: {labels.shape}")
-    log(f"   Feature shape per event: {list(features_dict[0].shape)}")
-    if len(feature_names) > 10:
-        log(f"   Feature names ({len(feature_names)}): {feature_names[:10]}...")
+    log(f"\n📊 Loading labels...")
+    label_chunks = [np.load(lf).astype(np.int8) for lf in label_files]
+    labels = np.concatenate(label_chunks) if len(label_chunks) > 1 else label_chunks[0]
+    log(f"  ✓ Labels: {labels.shape} ({labels.nbytes/1024**2:.1f} MB)")
+    del label_chunks; gc.collect()
+    if tracker: tracker.log_measurement("labels_loaded")
+    
+    num_events = metadata.get('total_events', labels.shape[0] if labels.ndim==2 else len(event_files)*1000)
+    
+    # Only load needed events
+    if getattr(args, 'inference_only', False):
+        load_start = int(num_events * args.train_ratio)
+        load_end = num_events
+        log(f"\n🔮 Inference-only: loading test events {load_start}-{load_end-1}")
     else:
-        log(f"   Feature names: {feature_names}")
+        load_start = 0; load_end = num_events
     
-    return features_dict, unscaled_dict, pairs, labels, cluster_info, input_dim, feature_names
+    log(f"   Events to load: {load_end-load_start}")
+    log(f"\n📊 Loading event features...")
+    
+    features_dict = {}; cluster_info = {}; feature_names = []
+    if args.baseline and not args.all_features:
+        feature_names = ['snr', 'eta', 'phi']; input_dim = 3
+    else:
+        input_dim = 0
+    
+    global_event_idx = 0; loaded_count = 0
+    static_fields = ['deta', 'dphi', 'volume', 'noise_mean', 'noise_std', 'noise_count', 'noise_category', 'num_neighbors']
+    
+    for file_idx, event_file in enumerate(event_files):
+        file_start_time = time.perf_counter()
+        log(f"\n  📂 File {file_idx+1}/{len(event_files)}: {os.path.basename(event_file)}")
+        
+        with h5py.File(event_file, 'r') as h5f:
+            if 'cell/snr_computed' in h5f: file_num_events = h5f['cell/snr_computed'].shape[0]
+            elif 'cell/energy_raw' in h5f: file_num_events = h5f['cell/energy_raw'].shape[0]
+            else: file_num_events = num_events//len(event_files) if len(event_files)>1 else num_events
+            
+            file_start_global = global_event_idx; file_end_global = global_event_idx + file_num_events
+            if file_end_global <= load_start or file_start_global >= load_end:
+                log(f"     ⏭️  Skipping (outside load range)")
+                global_event_idx += file_num_events; continue
+            
+            log(f"     Events: {file_num_events}")
+            
+            # Feature discovery on first non-skipped file
+            if args.all_features and not feature_names:
+                feature_names = []
+                for key in ['snr_computed', 'snr_raw', 'energy_raw', 'noise_raw', 'cell_eta', 'cell_phi']:
+                    h5_key = f'cell/{key}' if key in ['cell_eta', 'cell_phi'] else key
+                    if key in ['cell_eta', 'cell_phi']:
+                        if f'cell/{key}' in h5f: feature_names.append('eta' if key=='cell_eta' else 'phi')
+                    else:
+                        if key in h5f: feature_names.append(key)
+                if 'cell/cell_cluster_index' in h5f:
+                    feature_names.extend(['in_cluster', 'cluster_id_norm'])
+                for field in static_fields:
+                    if field in cells.dtype.names: feature_names.append(field)
+                if 'subcalo' in cells.dtype.names:
+                    for i in range(max(4, cells['subcalo'].max()+1)):
+                        feature_names.append(f'subcalo_{i}')
+                if 'sampling' in cells.dtype.names:
+                    for i in range(max(3, cells['sampling'].max()+1)):
+                        feature_names.append(f'sampling_{i}')
+                input_dim = len(feature_names)
+                log(f"\n     📋 Discovered {input_dim} features")
+            
+            # Pre-load full slices for all needed datasets
+            if args.baseline and not args.all_features:
+                # CORRECTED: Three-tier SNR fallback matching original logic
+                # snr_computed → snr_raw → energy/noise computation → zeros
+                if 'cell/snr_computed' in h5f:
+                    snr_full = h5f['cell/snr_computed'][:]
+                elif 'cell/snr_raw' in h5f:
+                    snr_full = h5f['cell/snr_raw'][:]
+                elif 'cell/energy_raw' in h5f:
+                    energy_full = h5f['cell/energy_raw'][:]
+                    noise_full = h5f['cell/noise_raw'][:]
+                    noise_full_safe = np.where(noise_full == 0, 1e-6, noise_full)
+                    snr_full = energy_full / noise_full_safe
+                else:
+                    snr_full = np.zeros((file_num_events, num_cells), dtype=np.float32)
+                
+                # eta/phi: bulk load from HDF5 or fall back to static cell arrays
+                if 'cell/cell_eta' in h5f:
+                    eta_full = h5f['cell/cell_eta'][:]
+                    phi_full = h5f['cell/cell_phi'][:]
+                else:
+                    # Store as 1D arrays to avoid materializing tiled (num_events, num_cells)
+                    eta_full = cells['eta_event0'].astype(np.float32)  # shape (num_cells,)
+                    phi_full = cells['phi_event0'].astype(np.float32)
+            else:
+                # All-features mode: bulk-load each HDF5 dataset
+                bulk_datasets = {}
+                for fname in feature_names:
+                    if fname in ['snr_computed', 'snr_raw', 'energy_raw', 'noise_raw'] and fname in h5f:
+                        bulk_datasets[fname] = h5f[fname][:]
+                    elif fname == 'eta' and 'cell/cell_eta' in h5f:
+                        bulk_datasets['eta'] = h5f['cell/cell_eta'][:]
+                    elif fname == 'phi' and 'cell/cell_phi' in h5f:
+                        bulk_datasets['phi'] = h5f['cell/cell_phi'][:]
+                    elif fname == 'in_cluster' and 'cell/cell_cluster_index' in h5f:
+                        bulk_datasets['cell_cluster_index'] = h5f['cell/cell_cluster_index'][:]
+                
+                # Pre-compute static cell features (same for all events)
+                static_features = []
+                for fname in feature_names:
+                    if fname in cells.dtype.names:
+                        static_features.append((fname, cells[fname].astype(np.float32)))
+                    elif fname.startswith('subcalo_'):
+                        i = int(fname.split('_')[1])
+                        static_features.append((fname, (cells['subcalo'].astype(np.int32) == i).astype(np.float32)))
+                    elif fname.startswith('sampling_'):
+                        i = int(fname.split('_')[1])
+                        static_features.append((fname, (cells['sampling'].astype(np.int32) == i).astype(np.float32)))
+            
+            # Now iterate events using pre-loaded slices
+            for local_idx in range(file_num_events):
+                event_idx = global_event_idx + local_idx
+                if event_idx < load_start or event_idx >= load_end: continue
+                loaded_count += 1
+                
+                if args.baseline and not args.all_features:
+                    # Handle both 2D (bulk loaded) and 1D (static fallback) arrays
+                    snr_row = snr_full[local_idx] if snr_full.ndim == 2 else snr_full
+                    eta_row = eta_full[local_idx] if eta_full.ndim == 2 else eta_full
+                    phi_row = phi_full[local_idx] if phi_full.ndim == 2 else phi_full
+                    features = np.stack([snr_row, eta_row, phi_row], axis=1).astype(np.float32)
+                else:
+                    features_list = []
+                    for fname in feature_names:
+                        if fname in bulk_datasets:
+                            features_list.append(bulk_datasets[fname][local_idx])
+                        elif fname == 'in_cluster' and 'cell_cluster_index' in bulk_datasets:
+                            cidx = bulk_datasets['cell_cluster_index'][local_idx]
+                            features_list.append((cidx >= 0).astype(np.float32))
+                        elif fname == 'cluster_id_norm' and 'cell_cluster_index' in bulk_datasets:
+                            cidx = bulk_datasets['cell_cluster_index'][local_idx]
+                            features_list.append(cidx.astype(np.float32) / max(1, cidx.max()))
+                        else:
+                            # Static features from cells array
+                            for sf_name, sf_data in static_features:
+                                if sf_name == fname:
+                                    features_list.append(sf_data)
+                                    break
+                    
+                    if 'cell_cluster_index' in bulk_datasets:
+                        cluster_info[event_idx] = {
+                            'cell_cluster_index': bulk_datasets['cell_cluster_index'][local_idx].astype(np.int32)
+                        }
+                    features = np.stack(features_list, axis=1).astype(np.float32)
+                
+                features_dict[event_idx] = features
+                if args.debug and loaded_count >= 5: break
+            
+            global_event_idx += file_num_events
+            if args.debug and loaded_count >= 5: break
+        
+        log(f"     ✅ File processed in {time.perf_counter()-file_start_time:.1f}s ({loaded_count} loaded)")
+    
+    if tracker: tracker.log_measurement("features_loaded", f"{len(features_dict)} events, {input_dim} features")
+    log(f"\n✅ Loaded {len(features_dict)} events, {num_cells} cells, {num_edges} edges, {input_dim} features")
+    return features_dict, None, pairs, labels, cluster_info, input_dim, feature_names
 
 
 # ============================================================================
-# LOSS FUNCTIONS (OPTIMIZED WITH GPU COMPUTATION)
+# LOSS FUNCTIONS
 # ============================================================================
 
 class FocalLoss(nn.Module):
-    """
-    Focal Loss for handling extreme class imbalance.
-    Supports class-specific alpha values for better minority class focus.
-    
-    FL(p_t) = -α_t * (1 - p_t)^γ * log(p_t)
-    
-    Args:
-        alpha: Can be:
-            - float: Single alpha for all classes
-            - list/tensor: Class-specific alpha values [α_0, α_1, ..., α_C]
-        gamma: Focusing parameter (higher = more focus on hard examples)
-        weight: Optional per-class weights (computed separately)
-        reduction: 'mean', 'sum', or 'none'
-    """
-    
-    def __init__(self, alpha: Union[float, List[float], torch.Tensor] = 0.25, 
-                 gamma: float = 2.0,
-                 weight: Optional[torch.Tensor] = None, 
-                 reduction: str = 'mean',
-                 chunk_size: int = 100000):  # Process in chunks of 100k edges
+    def __init__(self, alpha=0.25, gamma=2.0, weight=None, reduction='mean', chunk_size=100000):
         super().__init__()
-        self.gamma = gamma
-        self.weight = weight
-        self.reduction = reduction
-        self.chunk_size = chunk_size
-        
-        # Handle different alpha types
-        if isinstance(alpha, (float, int)):
-            self.alpha = float(alpha)
-            self.per_class_alpha = None
-        else:
-            if isinstance(alpha, list):
-                alpha = torch.tensor(alpha, dtype=torch.float32)
-            self.per_class_alpha = alpha
-            self.alpha = None
+        self.gamma = gamma; self.weight = weight; self.reduction = reduction; self.chunk_size = chunk_size
+        self.alpha = float(alpha) if isinstance(alpha, (float,int)) else None
+        self.per_class_alpha = torch.tensor(alpha, dtype=torch.float32) if isinstance(alpha, list) else None
             
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        Memory-efficient forward pass using chunking.
-        """
-        num_samples = inputs.size(0)
+    def forward(self, inputs, targets):
         total_loss = 0.0
-        num_chunks = 0
-        
-        # Process in chunks to save memory
-        for start_idx in range(0, num_samples, self.chunk_size):
-            end_idx = min(start_idx + self.chunk_size, num_samples)
-            
-            inputs_chunk = inputs[start_idx:end_idx]
-            targets_chunk = targets[start_idx:end_idx]
-            
-            # Compute cross-entropy loss for chunk
-            ce_loss = F.cross_entropy(
-                inputs_chunk, targets_chunk, 
-                weight=self.weight, reduction='none'
-            )
-            
-            # Compute p_t = exp(-CE_loss)
-            pt = torch.exp(-ce_loss)
-            
-            # Get alpha_t for each sample in chunk
-            if self.per_class_alpha is not None:
-                alpha_t = self.per_class_alpha.to(inputs.device)[targets_chunk]
-            else:
-                alpha_t = self.alpha
-            
-            # Compute Focal Loss for chunk
-            focal_loss_chunk = alpha_t * (1 - pt) ** self.gamma * ce_loss
-            
-            total_loss += focal_loss_chunk.sum()
-            num_chunks += 1
-            
-            # Free memory
-            del inputs_chunk, targets_chunk, ce_loss, pt, focal_loss_chunk
-        
-        # Apply reduction
-        if self.reduction == 'mean':
-            return total_loss / num_samples
-        elif self.reduction == 'sum':
-            return total_loss
-        else:
-            # For 'none', we'd need to return all, but that uses memory
-            # Return mean as fallback
-            return total_loss / num_samples
+        for start in range(0, inputs.size(0), self.chunk_size):
+            end = min(start+self.chunk_size, inputs.size(0))
+            ce = F.cross_entropy(inputs[start:end], targets[start:end], weight=self.weight, reduction='none')
+            pt = torch.exp(-ce)
+            alpha_t = self.per_class_alpha.to(inputs.device)[targets[start:end]] if self.per_class_alpha is not None else self.alpha
+            total_loss += (alpha_t * (1-pt)**self.gamma * ce).sum()
+        return total_loss/inputs.size(0) if self.reduction=='mean' else total_loss
 
-def compute_class_weights(labels: np.ndarray, num_classes: int, 
-                          strategy: str = 'inverse', device: torch.device = None,
-                          **kwargs) -> torch.Tensor:
-    """
-    Compute class weights for imbalanced classification.
-    OPTIMIZED: Uses PyTorch on GPU for faster computation.
-    """
-    # Move to GPU for faster computation if available
-    if device is not None and device.type == 'cuda':
-        labels_tensor = torch.as_tensor(labels, device=device).flatten()
-        counts = torch.bincount(labels_tensor, minlength=num_classes).float()
+def compute_class_weights(labels, num_classes, strategy='inverse', device=None, **kwargs):
+    if device and device.type=='cuda':
+        counts = torch.bincount(torch.as_tensor(labels, device=device).flatten(), minlength=num_classes).float()
     else:
-        counts_np = np.bincount(labels.flatten(), minlength=num_classes)
-        counts = torch.tensor(counts_np, dtype=torch.float32)
-    
+        counts = torch.tensor(np.bincount(labels.flatten(), minlength=num_classes), dtype=torch.float32)
     log(f"Class counts: {dict(zip(range(num_classes), counts.int().tolist()))}")
     
-    if strategy == 'focal':
-        alpha = kwargs.get('alpha', 0.25)
-        gamma = kwargs.get('gamma', 2.0)
+    if strategy=='focal':
         total = len(labels.flatten())
-        class_weights = (total - counts) / (counts + 1e-5)
-        weights = alpha * class_weights ** gamma
-        
-    elif strategy == 'logarithmic':
-        weights = 1.0 / torch.log1p(counts + 1e-5)
-        
-    elif strategy == 'manual':
-        # Strategic weights: prioritize rare but important classes
-        manual = torch.tensor([0.1, 10.0, 8.0, 8.0, 15.0], device=counts.device)
-        weights = manual[:num_classes]
-        
-    else:  # 'inverse'
-        weights = 1.0 / (counts + 1e-5)
+        weights = kwargs.get('alpha',0.25) * ((total-counts)/(counts+1e-5))**kwargs.get('gamma',2.0)
+    elif strategy=='logarithmic': weights = 1.0/torch.log1p(counts+1e-5)
+    elif strategy=='manual': weights = torch.tensor([0.1,10.0,8.0,8.0,15.0], device=counts.device)[:num_classes]
+    else: weights = 1.0/(counts+1e-5)
     
-    # Normalize
-    weights = weights / weights.sum() * num_classes
-    
+    weights = weights/weights.sum()*num_classes
     log(f"Computed weights ({strategy}): {weights.tolist()}")
-    
-    return weights.to(device) if device is not None else weights
+    return weights.to(device) if device else weights
 
-
-def create_loss_function(args, labels: np.ndarray, device: torch.device) -> nn.Module:
-    """
-    Create appropriate loss function based on arguments.
-    """
-    num_classes = 5
-    
-    # RECOMMENDED CLASS-SPECIFIC ALPHAS FOR YOUR DATASET
-    RECOMMENDED_ALPHAS = [0.10, 0.60, 0.70, 0.70, 1.00]  # Classes 0,1,2,3,4
-    
+def create_loss_function(args, labels, device):
     if args.weighted_loss:
-        class_weights = compute_class_weights(
-            labels, num_classes, 
-            strategy=args.weight_strategy,
-            device=device,
-            alpha=args.focal_alpha,
-            gamma=args.focal_gamma
-        )
-        
-        if args.weight_strategy == 'focal':
-            # Use class-specific alphas for extreme imbalance
-            loss_fn = FocalLoss(
-                alpha=RECOMMENDED_ALPHAS,  # Class-specific!
-                gamma=args.focal_gamma,    # Still controllable via --focal-gamma
-                weight=None
-            )
-            log(f"✅ Using Focal Loss with class-specific alphas: {RECOMMENDED_ALPHAS}")
-            log(f"   (No additional class weights - using alphas only)")
-            log(f"   Gamma: {args.focal_gamma}")
-        else:
-            loss_fn = nn.CrossEntropyLoss(weight=class_weights)
-            log(f"✅ Using Weighted CrossEntropyLoss ({args.weight_strategy})")
-    else:
-        loss_fn = nn.CrossEntropyLoss()
-        log("✅ Using standard CrossEntropyLoss")
-    
-    return loss_fn
+        class_weights = compute_class_weights(labels, 5, strategy=args.weight_strategy, device=device, alpha=args.focal_alpha, gamma=args.focal_gamma)
+        if args.weight_strategy=='focal':
+            log(f"✅ Using Focal Loss")
+            return FocalLoss(alpha=[0.10,0.60,0.70,0.70,1.00], gamma=args.focal_gamma)
+        log(f"✅ Using Weighted CrossEntropyLoss")
+        return nn.CrossEntropyLoss(weight=class_weights)
+    log("✅ Using standard CrossEntropyLoss")
+    return nn.CrossEntropyLoss()
+
 
 # ============================================================================
-# MODEL ARCHITECTURES (OPTIMIZED FORWARD PASS)
+# MODEL ARCHITECTURE
 # ============================================================================
 
 class GraphFoundationModel(nn.Module):
     """
-    Unified Graph Neural Network supporting multiple architectures.
-    STRICT EXACT REPLICA of old MultiEdgeClassifier for GCN.
+    Generic graph neural network for edge classification.
+
+    Supports multiple message-passing backbones (GCN, GAT, GraphSAGE,
+    TransformerConv) with optional learnable layer weighting.
     """
-    
-    def __init__(self,
-                 input_dim: int,
-                 hidden_dim: int,
-                 output_dim: int,
-                 device: torch.device,
-                 model_type: str = 'gcn',
-                 num_layers: int = 6,
-                 num_heads: int = 2,
-                 dropout: float = 0.0,
-                 layer_weights: bool = False,
-                 softmax_weights: bool = False,
-                 norm_type: str = 'batch',
-                 debug: bool = False):
+
+    def __init__(self, input_dim, hidden_dim, output_dim, device,
+                 model_type='gcn', num_layers=6, num_heads=2,
+                 dropout=0.0, layer_weights=False,
+                 softmax_weights=False, norm_type='batch', debug=False):
         super().__init__()
-        
+
+        # Store model configuration.
         self.device = device
         self.model_type = model_type
-        self.debug = debug
         self.num_layers = num_layers
-        self.layer_weights_enabled = layer_weights  # Boolean flag like old code
-        self.softmax = softmax_weights              # Named 'softmax' like old code
-        
-        # ============ EXACT OLD CODE INITIALIZATION ORDER ============
-        # 1. Node embedding
+        self.layer_weights_enabled = layer_weights
+        self.softmax = softmax_weights
+
+        # Project input node features into the hidden embedding space.
         self.node_embedding = nn.Linear(input_dim, hidden_dim)
-        
-        # 2. Convolution layers (named 'convs')
+
+        # Construct the requested graph convolution backbone.
         self.convs = nn.ModuleList()
-        if model_type == 'gcn':
-            for _ in range(num_layers):
+        for _ in range(num_layers):
+            if model_type == 'gcn':
                 self.convs.append(GCNConv(hidden_dim, hidden_dim))
-        elif model_type == 'gat':
-            for _ in range(num_layers):
-                self.convs.append(GATConv(hidden_dim, hidden_dim // num_heads, heads=num_heads, dropout=dropout))
-        elif model_type == 'transformer':
-            for _ in range(num_layers):
-                self.convs.append(TransformerConv(hidden_dim, hidden_dim // num_heads, heads=num_heads, dropout=dropout))
-        elif model_type == 'sage':
-            for _ in range(num_layers):
+
+            elif model_type == 'gat':
+                self.convs.append(
+                    GATConv(
+                        hidden_dim,
+                        hidden_dim // num_heads,
+                        heads=num_heads,
+                        dropout=dropout
+                    )
+                )
+
+            elif model_type == 'transformer':
+                self.convs.append(
+                    TransformerConv(
+                        hidden_dim,
+                        hidden_dim // num_heads,
+                        heads=num_heads,
+                        dropout=dropout
+                    )
+                )
+
+            elif model_type == 'sage':
                 self.convs.append(SAGEConv(hidden_dim, hidden_dim))
-        else:
-            raise ValueError(f"Unknown model type: {model_type}")
-        
-        # 3. BatchNorm layers (named 'bns' EXACTLY like old code)
+
+        # Create a normalization layer after each graph convolution.
         if norm_type == 'batch':
-            self.bns = nn.ModuleList([BatchNorm1d(hidden_dim) for _ in range(num_layers)])
+            self.bns = nn.ModuleList(
+                [BatchNorm1d(hidden_dim) for _ in range(num_layers)]
+            )
+
         elif norm_type == 'layer':
-            self.bns = nn.ModuleList([LayerNorm1d(hidden_dim) for _ in range(num_layers)])
-        elif norm_type == 'none':
-            self.bns = nn.ModuleList([nn.Identity() for _ in range(num_layers)])
+            self.bns = nn.ModuleList(
+                [LayerNorm1d(hidden_dim) for _ in range(num_layers)]
+            )
+
         else:
-            raise ValueError(f"Unknown norm type: {norm_type}")
-        
-        # 4. Edge classifier (named 'fc' EXACTLY like old code)
+            # No normalization.
+            self.bns = nn.ModuleList(
+                [nn.Identity() for _ in range(num_layers)]
+            )
+
+        # Final classifier operating on concatenated source and destination
+        # node embeddings for each edge.
         self.fc = nn.Linear(2 * hidden_dim, output_dim)
-        
-        # 5. Layer weights - EXACT old code behavior
+
+        # Optional learnable weighting of each message-passing layer.
         if layer_weights:
             self.layer_weights = nn.Parameter(torch.ones(num_layers))
-        # CRITICAL: When layer_weights=False, NO attribute is created (not even None)
-        
-        # ============ NO EXTRA ATTRIBUTES ============
-        # No self.norms alias
-        # No self.edge_classifier alias  
-        # No self.dropout_layer (nn.Identity or otherwise)
-        # No self._attention_weights
-        # No self.softmax_weights (use self.softmax)
-        # No register_buffer calls
-        # =============================================
-        
-        log(f"📐 Initialized {model_type.upper()} model (STRICT OLD CODE REPLICA):")
-        log(f"   Input dim: {input_dim}, Hidden dim: {hidden_dim}")
-        log(f"   Layers: {num_layers}, Norm: {norm_type}")
-        log(f"   Edge classifier: fc (Linear 2*{hidden_dim} -> {output_dim})")
-        log(f"   Layer weights: {'Enabled' if layer_weights else 'Disabled'}")
-    
-    def forward(self,
-                x_list: List[torch.Tensor],
-                edge_index_list: List[torch.Tensor],
-                edge_index_out_list: List[torch.Tensor],
-                y_batch: Optional[torch.Tensor] = None) -> torch.Tensor:
+
+        log(
+            f"📐 Initialized {model_type.upper()} model: "
+            f"input={input_dim}, hidden={hidden_dim}, layers={num_layers}"
+        )
+
+    def forward(self, x_list, edge_index_list, edge_index_out_list,
+                y_batch=None):
         """
-        Forward pass - EXACT MATCH to old MultiEdgeClassifier.
+        Compute edge predictions for a batch of graphs.
+
+        Parameters
+        ----------
+        x_list : list[Tensor]
+            Node feature matrices.
+        edge_index_list : list[Tensor]
+            Edge indices used during message passing.
+        edge_index_out_list : list[Tensor]
+            Original graph edges for which predictions are made.
         """
+        # Store edge representations from every graph in the batch.
         all_edge_reprs = []
-        
-        # Optional layer-weight normalization
-        # Uses boolean flag like old code
-        if self.layer_weights_enabled:
-            weights = (torch.softmax(self.layer_weights, dim=0)
-                       if self.softmax else self.layer_weights)
-        else:
-            weights = None
-        
-        # Process each graph in the batch
-        for x, proc_edges, orig_edges in zip(x_list, edge_index_list, edge_index_out_list):
+
+        # Compute layer weights if they are enabled.
+        weights = (
+            torch.softmax(self.layer_weights, dim=0)
+            if self.softmax else self.layer_weights
+        ) if self.layer_weights_enabled else None
+
+        # Process each graph independently.
+        for x, proc_edges, orig_edges in zip(
+            x_list, edge_index_list, edge_index_out_list
+        ):
+            # Move graph data to the target device.
             x = x.to(self.device, non_blocking=True)
             proc_edges = proc_edges.to(self.device, non_blocking=True)
-            
-            # Initial embedding (NO dropout, NO activation)
+
+            # Compute initial node embeddings.
             x_embed = self.node_embedding(x)
-            
-            # Apply GCN layers with residual connections
+
+            # Apply successive graph convolution layers with residual
+            # connections.
             for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
-                # Message passing + normalization + activation
                 h = torch.relu(bn(conv(x_embed, proc_edges)))
-                
-                # Optional layer weighting
+
+                # Optionally weight each layer's contribution.
                 if weights is not None:
                     h = weights[i] * h
-                
-                # Residual connection (NO dropout)
+
+                # Residual connection helps stabilize deep GNN training.
                 x_embed = x_embed + h
-            
-            # Build edge-level representations
+
+            # Retrieve embeddings for the source and destination nodes of
+            # each original edge.
             src, dst = orig_edges[0], orig_edges[1]
-            edge_repr = torch.cat([x_embed[src], x_embed[dst]], dim=-1)
-            all_edge_reprs.append(edge_repr)
-        
-        # Final classification
-        out = self.fc(torch.cat(all_edge_reprs, dim=0))
-        
-        # DEBUG
-        if self.debug:
-            print(f"[DEBUG] Model output dtype: {out.dtype}")
-            print(f"[DEBUG] Model output requires grad: {out.requires_grad}")
-        
-        return out
+
+            # Form an edge representation by concatenating endpoint
+            # embeddings.
+            all_edge_reprs.append(
+                torch.cat([x_embed[src], x_embed[dst]], dim=-1)
+            )
+
+        # Predict edge labels for all graphs in the batch.
+        return self.fc(torch.cat(all_edge_reprs, dim=0))
 
 # ============================================================================
-# DATA GENERATOR (OPTIMIZED WITH PINNED MEMORY)
+# DATA GENERATOR
 # ============================================================================
 
 class MultiClassBatchGenerator(IterableDataset):
     """
-    Optimized IterableDataset for large events.
-    OPTIMIZED: Uses pinned memory for faster GPU transfers.
+    Iterable dataset that streams graph samples in chunks to reduce memory
+    usage while supporting efficient GPU training.
     """
-    
-    def __init__(
-        self,
-        features_dict: Dict[int, np.ndarray],
-        neighbor_pairs: np.ndarray,
-        labels: np.ndarray,
-        mode: str = "train",
-        is_bi_directional: bool = True,
-        batch_size: int = 1,
-        train_ratio: float = 0.7,
-        debug: bool = False,
-        unscaled_data_dict: Optional[Dict[int, np.ndarray]] = None,
-        cluster_info_dict: Optional[Dict[int, Dict]] = None,
-    ):
+
+    def __init__(self, features_dict, neighbor_pairs, labels,
+                 mode="train", is_bi_directional=True,
+                 batch_size=1, train_ratio=0.7, debug=False,
+                 unscaled_data_dict=None, cluster_info_dict=None,
+                 chunk_size=2000, inference_only=False):
+
+        # Store dataset configuration.
         self.debug = debug
-        self.is_bi_directional = is_bi_directional
         self.batch_size = batch_size
-        self.cluster_info_dict = cluster_info_dict
-        self.num_events = len(features_dict)
+        self.mode = mode
         self.num_pairs = neighbor_pairs.shape[0]
-        
-        # Validate labels
-        if labels.ndim != 2:
-            raise ValueError(f"Labels must be 2D array, got shape {labels.shape}")
-        
-        # OPTIMIZED: Pre-convert to tensors with pinned memory for faster GPU transfer
-        self.features_dict = {}
-        for k, v in features_dict.items():
-            t = torch.as_tensor(v, dtype=torch.float32)
-            if torch.cuda.is_available():
-                t = t.pin_memory()
-            self.features_dict[k] = t
-        
-        if unscaled_data_dict is not None:
-            self.unscaled_features_dict = {}
-            for k, v in unscaled_data_dict.items():
-                t = torch.as_tensor(v, dtype=torch.float32)
-                if torch.cuda.is_available():
-                    t = t.pin_memory()
-                self.unscaled_features_dict[k] = t
-        else:
-            self.unscaled_features_dict = None
-        
-        # Pin memory for pairs and labels
-        self.neighbor_pairs = torch.as_tensor(neighbor_pairs, dtype=torch.long)
-        self.labels = torch.as_tensor(labels, dtype=torch.long)
+        self.chunk_size = chunk_size
+        self.inference_only = inference_only
+
+        # Store references to the underlying data.
+        self._features_dict = features_dict
+        self._unscaled_dict = unscaled_data_dict
+        self._labels = labels
+        self._cluster_info_dict = cluster_info_dict
+
+        # Convert neighbor pairs to a PyTorch tensor.
+        self.neighbor_pairs = torch.as_tensor(
+            neighbor_pairs, dtype=torch.long
+        )
+
+        # Pin memory to speed up CPU → GPU transfers.
         if torch.cuda.is_available():
             self.neighbor_pairs = self.neighbor_pairs.pin_memory()
-            self.labels = self.labels.pin_memory()
-        
-        # Split events
-        split_idx = int(self.num_events * train_ratio)
-        
-        if mode == "train":
-            self.event_indices = list(range(0, split_idx))
-        else:
-            self.event_indices = list(range(split_idx, self.num_events))
-        
-        log(f"📊 {mode.upper()} SET: Events {self.event_indices[0]}-{self.event_indices[-1]} "
-            f"({len(self.event_indices)} events)")
-        
-        # Precompute samples
-        self.precomputed_samples = self._precompute_all_samples()
-    
-    def _precompute_all_samples(self) -> List[Tuple]:
-        """Precompute all event samples for fast iteration."""
-        samples: List[Tuple] = []
-        
-        pairs_t = self.neighbor_pairs.T
-        
-        for event_idx in self.event_indices:
-            if event_idx not in self.features_dict:
-                continue
-            
-            x_scaled = self.features_dict[event_idx]
-            x_unscaled = (self.unscaled_features_dict.get(event_idx)
-                          if self.unscaled_features_dict else None)
-            
-            out_labels = self.labels[event_idx]
-            out_labels = out_labels.unsqueeze(1) if out_labels.dim() == 1 else out_labels
-            
-            cluster_info = (self.cluster_info_dict.get(event_idx) 
-                           if self.cluster_info_dict else None)
-            
-            samples.append((x_scaled, pairs_t, pairs_t.clone(), 
-                           out_labels, x_unscaled, cluster_info))
-        
-        return samples
-    
-    def __iter__(self):
-        for s in self.precomputed_samples:
-            yield s
-    
-    def __len__(self):
-        return len(self.precomputed_samples)
-    
-    @staticmethod
-    def collate_data(batch: List[Tuple]) -> Tuple:
-        """Combine list of samples into batch format."""
-        x_list = [b[0] for b in batch]
-        edge_index_list = [b[1] for b in batch]
-        edge_index_out_list = [b[2] for b in batch]
-        y_batch = torch.cat([b[3] for b in batch], dim=0)
-        unscaled_list = None if batch[0][4] is None else [b[4] for b in batch]
-        cluster_info_list = None if batch[0][5] is None else [b[5] for b in batch]
-        return x_list, edge_index_list, edge_index_out_list, y_batch, unscaled_list, cluster_info_list
 
+        # Store the edge list in the format expected by PyTorch Geometric.
+        # Making it contiguous avoids repeated internal copies during graph
+        # convolutions.
+        self.pairs_t = self.neighbor_pairs.T.contiguous()
+
+        # Split events into training and validation/test sets using the
+        # actual event IDs instead of assuming consecutive numbering.
+        all_event_ids = sorted(self._features_dict.keys())
+        self.num_events = len(all_event_ids)
+
+        split_idx = int(self.num_events * train_ratio)
+
+        if mode == "train":
+            self.event_indices = all_event_ids[:split_idx]
+        else:
+            self.event_indices = all_event_ids[split_idx:]
+
+        pin_msg = " [pinned]" if torch.cuda.is_available() else ""
+
+        log(
+            f"📊 {mode.upper()} SET: {len(self.event_indices)} events "
+            f"[CUDA, chunk={chunk_size}{pin_msg}]"
+        )
+
+        # Number of chunks required to process the dataset.
+        self.num_chunks = (
+            len(self.event_indices) + chunk_size - 1
+        ) // chunk_size
+
+        # Storage for the currently loaded chunk.
+        self._chunk_data = []
+
+    def _load_chunk(self, chunk_idx):
+        """
+        Load a single chunk of events into memory.
+        """
+        start = chunk_idx * self.chunk_size
+        end = min(start + self.chunk_size, len(self.event_indices))
+
+        chunk_events = self.event_indices[start:end]
+
+        # Periodically report loading progress.
+        if (
+            self.debug
+            or self.num_chunks <= 1
+            or chunk_idx % max(1, self.num_chunks // 5) == 0
+        ):
+            log(
+                f"  📂 Chunk {chunk_idx+1}/{self.num_chunks}: "
+                f"events {chunk_events[0]}-{chunk_events[-1]} "
+                f"({len(chunk_events)})"
+            )
+
+        chunk_samples = []
+
+        # Construct one graph sample for each event.
+        for event_idx in chunk_events:
+
+            # Skip missing events.
+            if event_idx not in self._features_dict:
+                continue
+
+            # Load node features.
+            x_scaled = torch.as_tensor(
+                self._features_dict[event_idx],
+                dtype=torch.float32
+            )
+
+            # Pin feature memory for faster GPU transfers.
+            if torch.cuda.is_available():
+                x_scaled = x_scaled.pin_memory()
+
+            # Load edge labels.
+            out_labels = torch.as_tensor(
+                self._labels[event_idx],
+                dtype=torch.long
+            ).unsqueeze(1)
+
+            if torch.cuda.is_available():
+                out_labels = out_labels.pin_memory()
+
+            # Optional per-cluster metadata.
+            cluster_info = (
+                self._cluster_info_dict.get(event_idx)
+                if self._cluster_info_dict
+                else None
+            )
+
+            # Each sample consists of:
+            #   - node features
+            #   - graph edges used for message passing
+            #   - output edges for prediction
+            #   - labels
+            #   - placeholder (unused)
+            #   - optional cluster information
+            chunk_samples.append((
+                x_scaled,
+                self.pairs_t,
+                self.pairs_t.clone(),
+                out_labels,
+                None,
+                cluster_info
+            ))
+
+        return chunk_samples
+
+    def _free_chunk(self):
+        """
+        Release the currently loaded chunk to keep memory usage low.
+        """
+        if self._chunk_data:
+            del self._chunk_data
+            self._chunk_data = []
+            gc.collect()
+
+        # Clear any cached GPU allocations.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def __iter__(self):
+        """
+        Iterate over the dataset one chunk at a time.
+        """
+        for chunk_idx in range(self.num_chunks):
+
+            # Free the previous chunk before loading the next one.
+            self._free_chunk()
+
+            self._chunk_data = self._load_chunk(chunk_idx)
+
+            # Yield each graph sample individually.
+            for sample in self._chunk_data:
+                yield sample
+
+                # In debug mode, only process a few samples.
+                if (
+                    self.debug
+                    and chunk_idx == 0
+                    and len(self._chunk_data[:5]) >= 5
+                ):
+                    break
+
+            # Only process the first chunk when debugging.
+            if self.debug:
+                break
+
+        self._free_chunk()
+
+    def __len__(self):
+        """Return the number of events in the selected dataset split."""
+        return len(self.event_indices)
+
+    @staticmethod
+    def collate_data(batch):
+        """
+        Custom DataLoader collation function.
+
+        Combines a list of graph samples into batched lists of node features,
+        edge indices, and concatenated edge labels.
+        """
+        return (
+            [b[0] for b in batch],                    # Node features
+            [b[1] for b in batch],                    # Message-passing edges
+            [b[2] for b in batch],                    # Output edges
+            torch.cat([b[3] for b in batch], dim=0),  # Edge labels
+            None,
+            None
+        )
 
 # ============================================================================
 # TRAINING FUNCTIONS
 # ============================================================================
 
-def train_epoch(model: nn.Module, loader: DataLoader, optimizer: optim.Optimizer,
-                criterion: nn.Module, scaler, device: torch.device,
-                debug: bool = False, accumulation_steps: int = 1, 
-                epoch: int = 0) -> Dict[str, float]:
-    """Train the model for one epoch with optional debugging."""
+def train_epoch(model, loader, optimizer, criterion, scaler,
+                device, debug=False, accumulation_steps=1, epoch=0):
+    """
+    Train the model for one epoch.
+
+    Supports mixed-precision training and gradient accumulation.
+    """
+
     model.train()
-    
-    total_loss = 0.0
-    correct = total = 0
-    
+
+    total_loss = 0
+    correct = 0
+    total = 0
+
+    # Reset gradients before starting the epoch.
     optimizer.zero_grad(set_to_none=True)
-    
-    # Determine if we're using mixed precision
-    use_amp = scaler is not None
-    
+
     for batch_idx, batch in enumerate(loader):
-        
-        # ============ DEBUGGING INTEGRATION ============
-        if DEBUG_AVAILABLE and DEBUG_CONFIG['enabled']:
-            # Deep dive on first batch of first epoch
-            if epoch == 0 and batch_idx == 0 and debug:
-                debug_print("\n🔬 PERFORMING DEEP DIVE ON FIRST BATCH", force=True)
-                deep_dive_single_batch(model, batch, criterion, optimizer, device)
-            
-            # Debug forward pass
-            if batch_idx < 3 or debug:  # Debug first 3 batches
-                logits, y_batch, _ = debug_forward_pass(
-                    model, batch, epoch * len(loader) + batch_idx, device
-                )
-                
-                # Compute loss with debugging
-                loss_val = debug_loss_and_backward(
-                    logits, y_batch, criterion, model, optimizer, scaler,
-                    epoch * len(loader) + batch_idx
-                )
-                
-                if loss_val is None:  # NaN or Inf loss
-                    debug_print("❌ Aborting batch due to invalid loss", force=True)
-                    continue
-                
-                loss = torch.tensor(loss_val, device=device) / accumulation_steps
-                
-                # Debug accuracy
-                acc = debug_batch_accuracy(logits, y_batch, epoch * len(loader) + batch_idx)
-                
-                # Handle optimizer step for debug path
-                if (batch_idx + 1) % accumulation_steps == 0:
-                    if scaler is not None:
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                
-                # Track metrics
-                total_loss += loss_val * len(y_batch)
-                correct += (logits.argmax(dim=1) == y_batch).sum().item()
-                total += len(y_batch)
-                
-                continue  # Skip normal training flow for debugged batches
-        # ============ END DEBUGGING ============
-        
-        # Normal training flow
-        x_list, edge_idx_list, edge_idx_out_list, y_batch, _, _ = batch
-        
-        # Move to device
+
+        x_list, ei_list, eio_list, y_batch, _, _ = batch
+
+        # Move graph data and labels to GPU/target device.
         x_list = [x.to(device, non_blocking=True) for x in x_list]
-        edge_idx_list = [e.to(device, non_blocking=True) for e in edge_idx_list]
-        edge_idx_out_list = [e.to(device, non_blocking=True) for e in edge_idx_out_list]
+        ei_list = [e.to(device, non_blocking=True) for e in ei_list]
+        eio_list = [e.to(device, non_blocking=True) for e in eio_list]
         y_batch = y_batch.to(device, non_blocking=True).squeeze(1)
-        
-        # Forward pass - NO AUTOCAST (we handle precision manually)
-        scores = model(x_list, edge_idx_list, edge_idx_out_list)
-        loss = criterion(scores, y_batch) / accumulation_steps
-        
-        # Force float32 for loss to prevent gradient underflow
-        loss = loss.float()
-        
+
+        # Forward pass
+        scores = model(x_list, ei_list, eio_list)
+
+        # Scale the loss when using gradient accumulation.
+        loss = criterion(scores, y_batch).float() / accumulation_steps
+
         # Backward pass
-        if use_amp:
+        if scaler:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        
-        # Optimizer step
+
+        # Optimizer update
         if (batch_idx + 1) % accumulation_steps == 0:
-            if use_amp:
-                # Unscale gradients before clipping (optional but recommended)
+
+            if scaler:
+                # Unscale before stepping so gradients can be checked
+                # or clipped correctly if needed.
                 scaler.unscale_(optimizer)
-                # Optional: Gradient clipping for stability
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
                 scaler.step(optimizer)
                 scaler.update()
+
             else:
-                # Optional: Gradient clipping for stability
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+
+            # Reset gradients for the next accumulation cycle.
             optimizer.zero_grad(set_to_none=True)
-        
-        # Track metrics
+
+        # Multiply back by accumulation_steps because the loss was
+        # divided earlier for gradient accumulation.
         total_loss += loss.item() * len(y_batch) * accumulation_steps
+
+        # Convert logits into predicted class labels.
         preds = scores.argmax(dim=1)
+
         correct += (preds == y_batch).sum().item()
         total += len(y_batch)
-    
-    # Handle remaining gradients
-    if total > 0 and (batch_idx + 1) % accumulation_steps != 0:
-        if use_amp:
-            scaler.unscale_(optimizer)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-    
+
     return {
         "loss": total_loss / total if total else 0,
-        "acc": correct / total if total else 0,
+        "acc": correct / total if total else 0
     }
 
-def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module,
-             device: torch.device, use_amp: bool = False, num_classes: int = 5) -> Dict[str, float]:
-    """Evaluate the model with comprehensive metrics: Recall, Precision, F1 (Macro + Weighted)."""
-    model.eval()
-    total_loss = correct = total = 0
-    
-    # Full confusion matrix
+def compute_metrics_from_numpy(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    total_loss: float,
+    total_samples: int,
+    num_classes: int = 5
+) -> Dict:
+    """
+    Compute classification metrics from NumPy arrays.
+
+    Uses a vectorized confusion matrix implementation to efficiently
+    compute per-class and aggregate metrics.
+    """
+
+    # Build the confusion matrix without explicit Python loops.
     cm = np.zeros((num_classes, num_classes), dtype=np.int64)
-    
-    with torch.no_grad():
-        for x_list, edge_idx_list, edge_idx_out_list, y_batch, _, _ in loader:
-            x_list = [x.to(device, non_blocking=True) for x in x_list]
-            edge_idx_list = [e.to(device, non_blocking=True) for e in edge_idx_list]
-            edge_idx_out_list = [e.to(device, non_blocking=True) for e in edge_idx_out_list]
-            y_batch = y_batch.to(device, non_blocking=True).squeeze(1)
-            
-            # Forward pass
-            scores = model(x_list, edge_idx_list, edge_idx_out_list)
-            loss = criterion(scores, y_batch)
-            
-            # Force float32
-            loss = loss.float()
-            
-            total_loss += loss.item() * len(y_batch)
-            preds = scores.argmax(dim=1)
-            correct += (preds == y_batch).sum().item()
-            total += len(y_batch)
-            
-            # Build confusion matrix
-            y_np = y_batch.cpu().numpy()
-            preds_np = preds.cpu().numpy()
-            for i in range(len(y_np)):
-                cm[y_np[i], preds_np[i]] += 1
-    
-    # ===== Compute all metrics from confusion matrix =====
-    
-    # Per-class components
-    TP = np.diag(cm)                           # True Positives (diagonal elements)
-    FP = cm.sum(axis=0) - TP                   # False Positives (column sum minus diagonal)
-    FN = cm.sum(axis=1) - TP                   # False Negatives (row sum minus diagonal)
-    class_totals = cm.sum(axis=1)              # Total actual samples per class
-    class_weights = class_totals / cm.sum()    # Class frequency weights
-    
-    # Per-class metrics
-    recall = np.zeros(num_classes)      # True Positive Rate / Sensitivity
-    precision = np.zeros(num_classes)   # Positive Predictive Value
-    f1 = np.zeros(num_classes)          # Harmonic mean of Precision and Recall
-    
-    for c in range(num_classes):
-        recall[c] = TP[c] / (TP[c] + FN[c]) if (TP[c] + FN[c]) > 0 else 0.0
-        precision[c] = TP[c] / (TP[c] + FP[c]) if (TP[c] + FP[c]) > 0 else 0.0
-        f1[c] = 2 * (precision[c] * recall[c]) / (precision[c] + recall[c]) if (precision[c] + recall[c]) > 0 else 0.0
-    
-    # ===== Macro metrics (unweighted average - each class counts equally) =====
-    macro_recall = np.mean(recall)
-    macro_precision = np.mean(precision)
-    macro_f1 = np.mean(f1)
-    
-    # ===== Weighted metrics (weighted by class frequency) =====
-    weighted_recall = np.sum(class_weights * recall)
-    weighted_precision = np.sum(class_weights * precision)
-    weighted_f1 = np.sum(class_weights * f1)
-    
-    # ===== Sum Scores (Normalized: 1.0 = random guessing, num_classes = perfect) =====
-    recall_sum_score = macro_recall * num_classes       # RSS: Recall Sum Score
-    f1_sum_score = macro_f1 * num_classes               # FSS: F1 Sum Score
-    weighted_recall_score = weighted_recall * num_classes
-    weighted_f1_score = weighted_f1 * num_classes       # WFSS: Weighted F1 Sum Score
-    
-    # ===== Build results dictionary =====
-    results = {
-        # Loss & basic accuracy
-        "loss": total_loss / total if total else 0,
-        "accuracy": correct / total if total else 0,
-        
-        # Per-class metrics
+    np.add.at(cm, (y_true, y_pred), 1)
+
+    cm_sum = cm.sum()
+
+    # Handle the edge case of an empty evaluation set.
+    if cm_sum == 0:
+        zero_dict = {
+            "loss": 0,
+            "accuracy": 0,
+            "macro_f1": 0,
+            "f1_sum_score": 0,
+            "randomness_metric": 0,
+            "macro_recall": 0,
+            "macro_precision": 0,
+            "weighted_recall": 0,
+            "weighted_precision": 0,
+            "weighted_f1": 0,
+            "weighted_recall_score": 0,
+            "weighted_f1_score": 0,
+            "class_totals": [0] * num_classes,
+            "confusion_matrix": cm.tolist()
+        }
+
+        zero_dict.update({
+            f"recall_class_{c}": 0.0
+            for c in range(num_classes)
+        })
+
+        zero_dict.update({
+            f"precision_class_{c}": 0.0
+            for c in range(num_classes)
+        })
+
+        zero_dict.update({
+            f"f1_class_{c}": 0.0
+            for c in range(num_classes)
+        })
+
+        return zero_dict
+
+    # Compute true positives, false positives, and false negatives for
+    # each class.
+    TP = np.diag(cm)
+    FP = cm.sum(axis=0) - TP
+    FN = cm.sum(axis=1) - TP
+
+    class_totals = cm.sum(axis=1)
+    class_weights = class_totals / cm_sum
+
+    # Compute per-class metrics.
+    recall = np.divide(
+        TP, TP + FN,
+        out=np.zeros(num_classes),
+        where=(TP + FN) > 0
+    )
+
+    precision = np.divide(
+        TP, TP + FP,
+        out=np.zeros(num_classes),
+        where=(TP + FP) > 0
+    )
+
+    f1 = np.divide(
+        2 * precision * recall,
+        precision + recall,
+        out=np.zeros(num_classes),
+        where=(precision + recall) > 0
+    )
+
+    # Overall classification accuracy.
+    accuracy = TP.sum() / cm_sum
+
+    return {
+        "loss": total_loss / total_samples if total_samples else 0,
+        "accuracy": accuracy,
+
+        # Per-class metrics.
         **{f"recall_class_{c}": recall[c] for c in range(num_classes)},
         **{f"precision_class_{c}": precision[c] for c in range(num_classes)},
         **{f"f1_class_{c}": f1[c] for c in range(num_classes)},
-        **{f"randomness_class_{c}": recall[c] * num_classes for c in range(num_classes)},
-        
-        # Macro (unweighted) metrics - each class counts equally (for physics!)
-        "macro_recall": macro_recall,
-        "macro_precision": macro_precision,
-        "macro_f1": macro_f1,
-        
-        # Weighted metrics - weighted by class frequency
-        "weighted_recall": weighted_recall,
-        "weighted_precision": weighted_precision,
-        "weighted_f1": weighted_f1,
-        
-        # Sum Scores (baseline = 1.0, perfect = num_classes)
-        "randomness_metric": recall_sum_score,          # RSS (original - Recall only)
-        "f1_sum_score": f1_sum_score,                   # FSS (NEW - FP-aware!)
-        "weighted_recall_score": weighted_recall_score,
-        "weighted_f1_score": weighted_f1_score,          # WFSS (NEW)
-        
-        # Raw confusion data for later analysis
+
+        # Macro-averaged metrics.
+        "macro_recall": np.mean(recall),
+        "macro_precision": np.mean(precision),
+        "macro_f1": np.mean(f1),
+
+        # Class-frequency-weighted metrics.
+        "weighted_recall": np.sum(class_weights * recall),
+        "weighted_precision": np.sum(class_weights * precision),
+        "weighted_f1": np.sum(class_weights * f1),
+
+        # Scaled summary scores used by this project.
+        "randomness_metric": np.mean(recall) * num_classes,
+        "f1_sum_score": np.mean(f1) * num_classes,
+        "weighted_recall_score":
+            np.sum(class_weights * recall) * num_classes,
+        "weighted_f1_score":
+            np.sum(class_weights * f1) * num_classes,
+
+        # Additional diagnostic information.
         "class_totals": class_totals.tolist(),
         "confusion_matrix": cm.tolist(),
     }
-    
-    return results
+
+def evaluate(model, loader, criterion, device,
+             use_amp=False, num_classes=5):
+    """
+    Evaluate the model on a validation or test dataset.
+
+    Predictions are accumulated and all metrics are computed at the end
+    using a vectorized confusion matrix.
+    """
+    model.eval()
+
+    total_loss = 0.0
+    total = 0
+
+    # Store predictions for metric computation.
+    all_labels = []
+    all_preds = []
+
+    with torch.no_grad():
+        for x_list, ei_list, eio_list, y_batch, _, _ in loader:
+
+            # Move the batch to the target device.
+            x_list = [x.to(device, non_blocking=True) for x in x_list]
+            ei_list = [e.to(device, non_blocking=True) for e in ei_list]
+            eio_list = [e.to(device, non_blocking=True) for e in eio_list]
+            y_batch = y_batch.to(device, non_blocking=True).squeeze(1)
+
+            # Forward pass.
+            scores = model(x_list, ei_list, eio_list)
+
+            # Accumulate the total loss.
+            total_loss += (
+                criterion(scores, y_batch).float().item()
+                * len(y_batch)
+            )
+
+            # Convert logits into predicted class labels.
+            preds = scores.argmax(dim=1)
+
+            # Store predictions on the CPU for metric computation.
+            all_labels.append(y_batch.cpu().numpy())
+            all_preds.append(preds.cpu().numpy())
+
+            total += len(y_batch)
+
+    # Merge all batches into contiguous arrays.
+    y_true = (
+        np.concatenate(all_labels)
+        if all_labels else np.array([], dtype=np.int64)
+    )
+
+    y_pred = (
+        np.concatenate(all_preds)
+        if all_preds else np.array([], dtype=np.int64)
+    )
+
+    # Compute all evaluation metrics.
+    return compute_metrics_from_numpy(
+        y_true,
+        y_pred,
+        total_loss,
+        total,
+        num_classes
+    )
+
+# ============================================================================
+# BATCHED INFERENCE
+# ============================================================================
 
 @torch.no_grad()
-def run_inference(model: nn.Module, generator: MultiClassBatchGenerator, 
-                  device: torch.device, debug: bool = False, show_progress: bool = True) -> List[Dict]:
-    """Run inference event-by-event with optional progress bar."""
+def run_inference(model, generator, device, criterion=None, num_classes=5,
+                  debug=False, show_progress=True, save_path=None,
+                  model_name=None):
+    """
+    Run model inference over a dataset.
+
+    Optionally computes loss and evaluation metrics during the same pass
+    to avoid running a separate evaluation loop.
+
+    Returns
+    -------
+    batch_results : list
+        Predictions, probabilities, labels, and edge information.
+    metrics_dict : dict or None
+        Computed metrics if criterion is provided, otherwise None.
+    """
+
+    # Disable dropout/batch statistics updates and switch to evaluation mode.
     model.eval()
-    all_results = []
-    
+
+    # Store inference outputs before periodically writing them to disk.
+    batch_results = []
+
+    # Number of events accumulated before saving results.
+    batch_size = 100
+
     total_events = len(generator)
-    
-    # Setup progress tracking
+
+    # Metric accumulators
+    total_loss = 0.0
+    total_samples = 0
+    all_labels_list = []
+    all_preds_list = []
+
+    # Progress bar handling
     if show_progress and not debug:
         try:
             from tqdm import tqdm
-            iterator = tqdm(enumerate(generator), total=total_events, 
-                          desc="   🔮 Inference", unit="events", 
-                          bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
-            use_tqdm = True
+
+            iterator = tqdm(
+                enumerate(generator),
+                total=total_events,
+                desc="   🔮 Inference",
+                unit="events"
+            )
+
         except ImportError:
-            use_tqdm = False
-            log("   (Install tqdm for progress bar: pip install tqdm)")
-    else:
-        use_tqdm = False
-    
-    # Use appropriate iterator
-    if use_tqdm:
-        iterator = iterator
+            # Fall back to a normal iterator if tqdm is unavailable.
+            iterator = enumerate(generator)
+
     else:
         iterator = enumerate(generator)
-    
-    for i, (x_scaled, edge_index, edge_index_out, y, x_unscaled, cluster_info) in iterator:
-        if hasattr(generator, 'event_indices') and i < len(generator.event_indices):
-            event_id = generator.event_indices[i]
-        else:
-            event_id = i
-        
-        # Simple progress update if not using tqdm
-        if show_progress and not use_tqdm and not debug and (i + 1) % 50 == 0:
-            pct = (i + 1) / total_events * 100
-            elapsed = time.perf_counter() - t0 if 't0' in locals() else 0
-            log(f"      Progress: {i + 1}/{total_events} events ({pct:.1f}%)")
-        
-        if i == 0:
-            t0 = time.perf_counter()
-        
+
+    # Main inference loop
+    for i, (
+        x_scaled,
+        edge_index,
+        edge_index_out,
+        y,
+        _,
+        cluster_info
+    ) in iterator:
+
+        # Move graph data to the target device.
         x_scaled = x_scaled.to(device, non_blocking=True)
         edge_index = edge_index.to(device, non_blocking=True)
         edge_index_out = edge_index_out.to(device, non_blocking=True)
-        
-        out = model([x_scaled], [edge_index], [edge_index_out])
+
+        # Run the GNN.
+        # Lists are used because the model supports batched graphs.
+        out = model(
+            [x_scaled],
+            [edge_index],
+            [edge_index_out]
+        )
+
+        # Convert logits into predictions and probabilities.
         preds = out.argmax(dim=1).cpu().numpy()
-        scores = torch.softmax(out, dim=1).cpu().numpy()
-        
+
+        scores = torch.softmax(
+            out,
+            dim=1
+        ).cpu().numpy()
+
+        # Extract source and destination nodes for each predicted edge.
         src_nodes = edge_index_out[0].cpu().numpy()
         dst_nodes = edge_index_out[1].cpu().numpy()
-        
-        labels_np = None
-        if y is not None:
-            if y.dim() == 2 and y.shape[1] == 1:
-                labels_np = y.squeeze(1).numpy()
-            else:
-                labels_np = y.numpy()
-        
-        all_results.append({
-            "event_id": event_id,
+
+        # Convert labels into NumPy format for metric computation.
+        labels_np = (
+            y.squeeze(1).numpy()
+            if y is not None and y.dim() == 2
+            else (y.numpy() if y is not None else None)
+        )
+
+        # Inline metric accumulation
+        if criterion is not None and labels_np is not None:
+
+            y_tensor = y.to(
+                device,
+                non_blocking=True
+            ).squeeze(1)
+
+            loss_val = (
+                criterion(out, y_tensor)
+                .float()
+                .item()
+                * len(y_tensor)
+            )
+
+            total_loss += loss_val
+            total_samples += len(y_tensor)
+
+            all_labels_list.append(labels_np)
+            all_preds_list.append(preds)
+
+        # Store inference results for this event.
+        batch_results.append({
+            "event_id": (
+                generator.event_indices[i]
+                if hasattr(generator, 'event_indices')
+                else i
+            ),
             "preds": preds,
             "scores": scores,
             "labels": labels_np,
-            "neighbor_pairs": np.stack([src_nodes, dst_nodes], axis=1),
+
+            # Original edge pairs used for prediction.
+            "neighbor_pairs": np.stack(
+                [src_nodes, dst_nodes],
+                axis=1
+            ),
+
+            # Optional cluster metadata.
             "cluster_info": cluster_info,
         })
-        
-        if debug and i >= 4:
-            log("Debug mode: stopping after 5 events")
-            break
-    
-    # Final summary
-    if show_progress and not debug and total_events > 0:
-        elapsed = time.perf_counter() - t0
-        log(f"   ✅ Inference complete: {len(all_results)} events in {elapsed:.1f}s ({elapsed/len(all_results):.2f}s/event)")
-    
-    return all_results
 
-def save_results_to_parquet(results: List[Dict], save_path: str, 
-                            model_name: str, cluster_info_dict: Dict = None) -> str:
+        # Periodic saving
+        if len(batch_results) >= batch_size and save_path:
+
+            log(
+                f"  💾 Saving batch ({i+1}/{total_events})..."
+            )
+
+            save_results_to_parquet(
+                batch_results,
+                save_path,
+                model_name,
+                append=True
+            )
+
+            batch_results = []
+
+            # Release unused Python/GPU memory.
+            gc.collect()
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Debug mode: only process a few events.
+        if debug and i >= 4:
+            log("Debug: stopping after 5 events")
+            break
+
+    # Save any remaining inference results.
+    if batch_results and save_path:
+        save_results_to_parquet(
+            batch_results,
+            save_path,
+            model_name,
+            append=True
+        )
+
+    # Final metric computation
+    metrics_dict = None
+
+    if criterion is not None and all_labels_list:
+
+        # Combine predictions from all events into one array.
+        y_true = np.concatenate(all_labels_list)
+        y_pred = np.concatenate(all_preds_list)
+
+        # Compute confusion matrix and derived metrics.
+        metrics_dict = compute_metrics_from_numpy(
+            y_true,
+            y_pred,
+            total_loss,
+            total_samples,
+            num_classes
+        )
+
+    return batch_results, metrics_dict
+
+
+# ============================================================================
+# PARQUET SAVING
+# ============================================================================
+
+def save_results_to_parquet(results, save_path, model_name,
+                            cluster_info_dict=None, append=False):
     """
-    Save inference results to Parquet format - OPTIMIZED VERSION.
-    Uses chunking, better compression, and auto-deletes existing files.
+    Convert inference outputs into a flat edge-level Parquet table.
+
+    Each row corresponds to one predicted edge and contains:
+        - event ID
+        - source/destination node IDs
+        - true and predicted labels
+        - prediction confidence
+        - class probabilities
+        - optional cluster information
+
+    Results are written incrementally to avoid large memory usage.
     """
+
+    # Nothing to save.
     if not results:
         return ""
-    
-    # ============ DELETE EXISTING FILE TO AVOID SCHEMA MISMATCH ============
-    if os.path.exists(save_path):
+
+    # Remove previous output when starting a fresh write.
+    if not append and os.path.exists(save_path):
         os.remove(save_path)
-        log(f"      Removed existing file: {os.path.basename(save_path)}")
-    # =====================================================================
 
-    log("   💾 Saving to Parquet (optimized)...")
-    total_edges = sum(len(r['preds']) for r in results)
-    log(f"      Total edges: {total_edges:,}")
+    if not append:
+        log("   💾 Saving to Parquet...")
 
-    # Process in chunks to reduce memory
-    chunk_size = 10  # Events per chunk
     writer = None
-    
-    # Determine if cluster info is available (check first result)
-    has_cluster_info = False
-    if results and results[0].get('cluster_info') is not None:
-        cluster_idx = results[0]['cluster_info'].get('cell_cluster_index')
-        has_cluster_info = (cluster_idx is not None)
-    
-    if has_cluster_info:
-        log(f"      Including cluster information in output")
 
-    for chunk_start in range(0, len(results), chunk_size):
-        chunk_end = min(chunk_start + chunk_size, len(results))
+    # When appending, preserve the original Parquet schema.
+    # This ensures all batches have identical column types.
+    if append and os.path.exists(save_path):
+        existing_schema = pq.ParquetFile(save_path).schema_arrow
+
+    # Check whether cluster information is available.
+    has_cluster = bool(
+        results and results[0].get('cluster_info')
+    )
+
+    # Process results in small chunks to control memory usage.
+    for chunk_start in range(0, len(results), 10):
+
+        chunk_end = min(chunk_start + 10, len(results))
         chunk_results = results[chunk_start:chunk_end]
 
-        # Calculate chunk size
-        chunk_edges = sum(len(r['preds']) for r in chunk_results)
+        # Total number of edges across this chunk.
+        chunk_edges = sum(
+            len(r['preds'])
+            for r in chunk_results
+        )
 
-        # Pre-allocate arrays for this chunk
+        # Allocate output arrays.
         event_ids = np.zeros(chunk_edges, dtype=np.int32)
         edge_ids = np.zeros(chunk_edges, dtype=np.int32)
-        source_ids = np.zeros(chunk_edges, dtype=np.int32)
-        target_ids = np.zeros(chunk_edges, dtype=np.int32)
-        true_labels = np.full(chunk_edges, -1, dtype=np.int8)
-        pred_labels = np.zeros(chunk_edges, dtype=np.int8)
-        confidence = np.zeros(chunk_edges, dtype=np.float32)
-        scores = np.zeros((chunk_edges, 5), dtype=np.float32)
-        
-        # Pre-allocate cluster arrays if needed
-        if has_cluster_info:
-            source_cluster = np.full(chunk_edges, -1, dtype=np.int32)
-            target_cluster = np.full(chunk_edges, -1, dtype=np.int32)
 
-        # Fill arrays
+        src = np.zeros(chunk_edges, dtype=np.int32)
+        dst = np.zeros(chunk_edges, dtype=np.int32)
+
+        true_labels = np.full(
+            chunk_edges,
+            -1,
+            dtype=np.int8
+        )
+
+        pred_labels = np.zeros(
+            chunk_edges,
+            dtype=np.int8
+        )
+
+        confidence = np.zeros(
+            chunk_edges,
+            dtype=np.float32
+        )
+
+        # Store probability for each class.
+        scores = np.zeros(
+            (chunk_edges, 5),
+            dtype=np.float32
+        )
+
+        # Optional cluster IDs.
+        if has_cluster:
+            src_cluster = np.full(
+                chunk_edges,
+                -1,
+                dtype=np.int32
+            )
+            dst_cluster = np.full(
+                chunk_edges,
+                -1,
+                dtype=np.int32
+            )
+
         offset = 0
+
+        # Flatten event-level predictions into edge-level rows.
         for result in chunk_results:
+
             n = len(result['preds'])
-            
+
             event_ids[offset:offset+n] = result['event_id']
             edge_ids[offset:offset+n] = np.arange(n)
-            source_ids[offset:offset+n] = result['neighbor_pairs'][:, 0]
-            target_ids[offset:offset+n] = result['neighbor_pairs'][:, 1]
-            
+
+            src[offset:offset+n] = result['neighbor_pairs'][:, 0]
+            dst[offset:offset+n] = result['neighbor_pairs'][:, 1]
+
             if result['labels'] is not None:
                 true_labels[offset:offset+n] = result['labels']
-            
+
             pred_labels[offset:offset+n] = result['preds']
-            confidence[offset:offset+n] = result['scores'][np.arange(n), result['preds']]
+
+            # Extract probability assigned to the predicted class.
+            confidence[offset:offset+n] = (
+                result['scores'][
+                    np.arange(n),
+                    result['preds']
+                ]
+            )
+
             scores[offset:offset+n] = result['scores']
-            
-            # Add cluster info if available
-            if has_cluster_info and result.get('cluster_info') is not None:
-                cidx = result['cluster_info'].get('cell_cluster_index', None)
+
+            # Add cluster-level information if available.
+            if has_cluster:
+                cidx = result['cluster_info'].get(
+                    'cell_cluster_index'
+                )
+
                 if cidx is not None:
-                    source_cluster[offset:offset+n] = cidx[result['neighbor_pairs'][:, 0]]
-                    target_cluster[offset:offset+n] = cidx[result['neighbor_pairs'][:, 1]]
-            
+                    src_cluster[offset:offset+n] = (
+                        cidx[result['neighbor_pairs'][:, 0]]
+                    )
+
+                    dst_cluster[offset:offset+n] = (
+                        cidx[result['neighbor_pairs'][:, 1]]
+                    )
+
             offset += n
-        
-        # Create DataFrame for this chunk
-        df_chunk = pd.DataFrame({
+
+        # Create a tabular representation for Parquet storage.
+        df = pd.DataFrame({
             'event_id': event_ids,
             'edge_id': edge_ids,
-            'source_id': source_ids,
-            'target_id': target_ids,
+            'source_id': src,
+            'target_id': dst,
             'true_label': true_labels,
             'pred_label': pred_labels,
             'confidence': confidence,
@@ -1376,606 +1567,279 @@ def save_results_to_parquet(results: List[Dict], save_path: str,
             'score_class_2': scores[:, 2],
             'score_class_3': scores[:, 3],
             'score_class_4': scores[:, 4],
-            'model_name': model_name,
+            'model_name': model_name
         })
-        
-        # Add cluster columns if available
-        if has_cluster_info:
-            df_chunk['source_cluster'] = source_cluster
-            df_chunk['target_cluster'] = target_cluster
-            df_chunk['same_cluster'] = (df_chunk['source_cluster'] == df_chunk['target_cluster']) & (df_chunk['source_cluster'] >= 0)
 
-        # Write chunk
-        table = pa.Table.from_pandas(df_chunk, preserve_index=False)
+        if has_cluster:
+            df['source_cluster'] = src_cluster
+            df['target_cluster'] = dst_cluster
 
+            # Useful diagnostic:
+            # whether both nodes belong to the same reconstructed cluster.
+            df['same_cluster'] = (
+                (src_cluster == dst_cluster)
+                & (src_cluster >= 0)
+            )
+
+        table = pa.Table.from_pandas(
+            df,
+            preserve_index=False
+        )
+
+        # Create the Parquet writer only once.
         if writer is None:
+            schema = (
+                existing_schema
+                if (append and os.path.exists(save_path))
+                else table.schema
+            )
+
             writer = pq.ParquetWriter(
                 save_path,
-                table.schema,
-                compression='zstd',  # Better compression than snappy
-                compression_level=3,  # Balance speed vs size
+                schema,
+                compression='zstd',
+                compression_level=3,
                 use_dictionary=True,
-                write_statistics=True,
+                write_statistics=True
             )
 
         writer.write_table(table)
 
-        # Progress update
-        pct = (chunk_end) / len(results) * 100
-        log(f"      Progress: {chunk_end}/{len(results)} events ({pct:.1f}%)")
-
-        # Free memory
-        del df_chunk, table, event_ids, edge_ids, source_ids, target_ids
-        del true_labels, pred_labels, confidence, scores
-        if has_cluster_info:
-            del source_cluster, target_cluster
+        # Release temporary memory.
+        del df, table
         gc.collect()
 
-    if writer is not None:
+    if writer:
         writer.close()
 
-    # Get file size
-    file_size = os.path.getsize(save_path) / (1024**3)
-    log(f"   💾 Results saved to: {save_path} ({file_size:.2f} GB)")
+    if not append:
+        log(
+            f"   💾 Saved: {save_path} "
+            f"({os.path.getsize(save_path)/1024**3:.2f} GB)"
+        )
+
     return save_path
 
 # ============================================================================
 # MAIN TRAINING FUNCTION
 # ============================================================================
 
-def train_model_full(model: nn.Module, 
-                     train_loader: DataLoader,
-                     test_loader: DataLoader,
-                     test_generator: MultiClassBatchGenerator,
-                     optimizer: optim.Optimizer,
-                     criterion: nn.Module,
-                     scaler,
-                     device: torch.device,
-                     args,
-                     model_name: str,
-                     cluster_info: Dict = None) -> Dict:
-    """Complete training loop with checkpointing and comprehensive evaluation."""
-    
-    # ============ DEBUGGING: Initial model inspection ============
-    if DEBUG_AVAILABLE and DEBUG_CONFIG['enabled']:
-        debug_print("\n" + "="*80, force=True)
-        debug_print("🔍 INITIAL MODEL INSPECTION", force=True)
-        debug_print("="*80, force=True)
-        
-        zero_weights = inspect_model_weights(model, detailed=True)
-        
-        if zero_weights:
-            debug_print("\n⚠️  WARNING: Model has zero-initialized weights!", force=True)
-        else:
-            debug_print("\n✅ All weights properly initialized", force=True)
-        
-        debug_print("\n📊 TRAINING DATA CLASS DISTRIBUTION:", force=True)
-        sample_batch = next(iter(train_loader))
-        _, _, _, y_batch, _, _ = sample_batch
-        debug_print(f"  Sample batch labels: {torch.unique(y_batch, return_counts=True)}", force=True)
-    
+def train_model_full(model, train_loader, test_loader, test_generator, optimizer, criterion, scaler,
+                     device, args, model_name, cluster_info=None, tracker=None):
+    """
+    Complete training pipeline.
+
+    Handles:
+        - checkpoint loading/resume
+        - epoch training
+        - evaluation
+        - best-model selection
+        - early stopping
+        - final inference
+        - metric saving
+    """
     os.makedirs(args.save_dir, exist_ok=True)
-    
     model_path = os.path.join(args.save_dir, model_name)
     best_model_path = os.path.join(args.save_dir, f"best_{model_name}")
     metrics_path = os.path.splitext(model_path)[0] + "_metrics.pkl"
     
-    best_epoch = 0
-    best_f1_sum_score = 0.0  # Use F1 Sum Score for model selection (FP-aware!)
-    best_randomness_metric = 0.0
-    best_macro_f1 = 0.0
-    start_epoch = 1
-    
-    num_classes = 5
-    
-    # Metrics tracking - comprehensive (NO MCC)
-    metrics = {
-        "train_loss": [], "test_loss": [],
-        "train_accuracy": [], "test_accuracy": [],
-        "test_macro_recall": [], "test_macro_precision": [], "test_macro_f1": [],
-        "test_weighted_recall": [], "test_weighted_precision": [], "test_weighted_f1": [],
-        "test_randomness_metric": [], "test_f1_sum_score": [],
-        "test_weighted_recall_score": [], "test_weighted_f1_score": [],
-        "test_recall_class_0": [], "test_recall_class_1": [], "test_recall_class_2": [], 
-        "test_recall_class_3": [], "test_recall_class_4": [],
-        "test_precision_class_0": [], "test_precision_class_1": [], "test_precision_class_2": [],
-        "test_precision_class_3": [], "test_precision_class_4": [],
-        "test_f1_class_0": [], "test_f1_class_1": [], "test_f1_class_2": [],
-        "test_f1_class_3": [], "test_f1_class_4": [],
-        "epoch_times": [],
-        "best_accuracy": 0.0,
-        "best_macro_recall": 0.0,
-        "best_macro_precision": 0.0,
-        "best_macro_f1": 0.0,
-        "best_weighted_recall": 0.0,
-        "best_weighted_precision": 0.0,
-        "best_weighted_f1": 0.0,
-        "best_randomness_metric": 0.0,
-        "best_f1_sum_score": 0.0,
-        "best_weighted_recall_score": 0.0,
-        "best_weighted_f1_score": 0.0,
-        "best_epoch": 0,
-        "total_time": 0.0,
-        "args": vars(args),
-    }
-    
-    # Resume from checkpoint
+    best_f1_sum_score = 0.0; best_epoch = 0; start_epoch = 1
+    metrics = {"train_loss":[],"test_loss":[],"train_accuracy":[],"test_accuracy":[],
+               "test_macro_recall":[],"test_macro_precision":[],"test_macro_f1":[],
+               "test_weighted_recall":[],"test_weighted_precision":[],"test_weighted_f1":[],
+               "test_randomness_metric":[],"test_f1_sum_score":[],"test_weighted_recall_score":[],"test_weighted_f1_score":[],
+               "epoch_times":[],
+               "best_accuracy":0.0,"best_macro_recall":0.0,"best_macro_precision":0.0,"best_macro_f1":0.0,
+               "best_weighted_recall":0.0,"best_weighted_precision":0.0,"best_weighted_f1":0.0,
+               "best_randomness_metric":0.0,"best_f1_sum_score":0.0,
+               "best_weighted_recall_score":0.0,"best_weighted_f1_score":0.0,
+               "best_epoch":0,"total_time":0.0,"args":vars(args)}
+    for c in range(5):
+        for m in ['recall','precision','f1']: metrics[f"test_{m}_class_{c}"] = []
+
     if args.resume:
         chk = find_latest_checkpoint(args.save_dir, model_name)
         if chk:
-            resumed_epoch, chk_path = chk
-            checkpoint = torch.load(chk_path, map_location=device, weights_only=True)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if scaler is not None and 'scaler_state_dict' in checkpoint:
-                scaler.load_state_dict(checkpoint['scaler_state_dict'])
-            start_epoch = resumed_epoch + 1
-            log(f"[Resume] Loaded checkpoint: {chk_path}")
-            
+            ckpt = torch.load(chk[1], map_location=device, weights_only=True)
+            model.load_state_dict(ckpt['model_state_dict']); optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            if scaler and 'scaler_state_dict' in ckpt: scaler.load_state_dict(ckpt['scaler_state_dict'])
+            start_epoch = chk[0]+1; log(f"[Resume] Loaded checkpoint: {chk[1]}")
             if os.path.exists(metrics_path):
                 try:
-                    with open(metrics_path, 'rb') as f:
-                        saved_metrics = pickle.load(f)
-                    metrics.update(saved_metrics)
-                    best_f1_sum_score = metrics.get("best_f1_sum_score", 0.0)
-                    best_randomness_metric = metrics.get("best_randomness_metric", 0.0)
-                    best_epoch = metrics.get("best_epoch", 0)
-                except:
-                    pass
+                    with open(metrics_path,'rb') as f: metrics.update(pickle.load(f))
+                    best_f1_sum_score = metrics.get("best_f1_sum_score",0.0); best_epoch = metrics.get("best_epoch",0)
+                except: pass
     
-    early_counter = 0
+    early_counter = 0; log(f"\n🚀 Starting training for {args.epochs} epochs...")
     
-    # Training loop
-    for epoch in range(start_epoch, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs+1):
         t0 = time.perf_counter()
-        
         train_res = train_epoch(model, train_loader, optimizer, criterion, scaler, device, args.debug, epoch=epoch)
-        test_res = evaluate(model, test_loader, criterion, device, use_amp=(scaler is not None))
+        test_res = evaluate(model, test_loader, criterion, device)
+        dt = time.perf_counter()-t0
         
-        dt = time.perf_counter() - t0
-        
-        # Store all metrics
-        metrics["epoch_times"].append(dt)
-        metrics["train_loss"].append(train_res["loss"])
-        metrics["train_accuracy"].append(train_res["acc"])
-        metrics["test_loss"].append(test_res["loss"])
-        metrics["test_accuracy"].append(test_res["accuracy"])
-        metrics["test_macro_recall"].append(test_res["macro_recall"])
-        metrics["test_macro_precision"].append(test_res["macro_precision"])
+        metrics["epoch_times"].append(dt); metrics["train_loss"].append(train_res["loss"]); metrics["train_accuracy"].append(train_res["acc"])
+        metrics["test_loss"].append(test_res["loss"]); metrics["test_accuracy"].append(test_res["accuracy"])
+        metrics["test_macro_recall"].append(test_res["macro_recall"]); metrics["test_macro_precision"].append(test_res["macro_precision"])
         metrics["test_macro_f1"].append(test_res["macro_f1"])
-        metrics["test_weighted_recall"].append(test_res["weighted_recall"])
-        metrics["test_weighted_precision"].append(test_res["weighted_precision"])
+        metrics["test_weighted_recall"].append(test_res["weighted_recall"]); metrics["test_weighted_precision"].append(test_res["weighted_precision"])
         metrics["test_weighted_f1"].append(test_res["weighted_f1"])
-        metrics["test_randomness_metric"].append(test_res["randomness_metric"])
-        metrics["test_f1_sum_score"].append(test_res["f1_sum_score"])
-        metrics["test_weighted_recall_score"].append(test_res["weighted_recall_score"])
-        metrics["test_weighted_f1_score"].append(test_res["weighted_f1_score"])
+        metrics["test_randomness_metric"].append(test_res["randomness_metric"]); metrics["test_f1_sum_score"].append(test_res["f1_sum_score"])
+        metrics["test_weighted_recall_score"].append(test_res["weighted_recall_score"]); metrics["test_weighted_f1_score"].append(test_res["weighted_f1_score"])
+        for c in range(5):
+            for m in ['recall','precision','f1']: metrics[f"test_{m}_class_{c}"].append(test_res.get(f'{m}_class_{c}',0.0))
         
-        for c in range(num_classes):
-            metrics[f"test_recall_class_{c}"].append(test_res.get(f'recall_class_{c}', 0.0))
-            metrics[f"test_precision_class_{c}"].append(test_res.get(f'precision_class_{c}', 0.0))
-            metrics[f"test_f1_class_{c}"].append(test_res.get(f'f1_class_{c}', 0.0))
-        
-        # ============ Best model tracking using F1 SUM SCORE (FP-aware!) ============
-        if test_res["f1_sum_score"] > best_f1_sum_score + 0.01:
-            best_f1_sum_score = test_res["f1_sum_score"]
-            best_randomness_metric = test_res["randomness_metric"]
-            best_macro_f1 = test_res["macro_f1"]
-            best_epoch = epoch
-            
-            # Update all best metrics
-            for key in ["accuracy", "macro_recall", "macro_precision", "macro_f1",
-                       "weighted_recall", "weighted_precision", "weighted_f1",
-                       "randomness_metric", "f1_sum_score", "weighted_recall_score", "weighted_f1_score"]:
+        if test_res["f1_sum_score"] > best_f1_sum_score+0.01:
+            best_f1_sum_score = test_res["f1_sum_score"]; best_epoch = epoch
+            for key in ["accuracy","macro_recall","macro_precision","macro_f1","weighted_recall","weighted_precision","weighted_f1",
+                       "randomness_metric","f1_sum_score","weighted_recall_score","weighted_f1_score"]:
                 metrics[f"best_{key}"] = test_res[key]
-            metrics["best_epoch"] = best_epoch
-            
-            early_counter = 0
-            
-            if not args.debug:
-                checkpoint_dict = {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                }
-                if scaler is not None:
-                    checkpoint_dict["scaler_state_dict"] = scaler.state_dict()
-                torch.save(checkpoint_dict, best_model_path)
-                log(f"  💾 Best model saved (F1_Sum={best_f1_sum_score:.2f}, Macro_F1={best_macro_f1:.4f}, Recall_Sum={best_randomness_metric:.2f})")
-        else:
-            early_counter += 1
+            metrics["best_epoch"] = best_epoch; early_counter = 0
+            torch.save({"epoch":epoch,"model_state_dict":model.state_dict(),"optimizer_state_dict":optimizer.state_dict(),
+                        **({"scaler_state_dict":scaler.state_dict()} if scaler else {})}, best_model_path)
+            log(f"  💾 Best model (F1_Sum={best_f1_sum_score:.2f})")
+        else: early_counter += 1
         
-        # Save checkpoint
         if not args.debug:
-            chk_path = os.path.join(args.save_dir, f"{os.path.splitext(model_name)[0]}_epoch{epoch}.pt")
-            checkpoint_dict = {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-            }
-            if scaler is not None:
-                checkpoint_dict["scaler_state_dict"] = scaler.state_dict()
-            torch.save(checkpoint_dict, chk_path)
+            torch.save({"epoch":epoch,"model_state_dict":model.state_dict(),"optimizer_state_dict":optimizer.state_dict()},
+                      os.path.join(args.save_dir, f"{os.path.splitext(model_name)[0]}_epoch{epoch}.pt"))
         
-        if args.debug or epoch % 5 == 0:
-            log(f"[Epoch {epoch}] Time {dt:.1f}s  "
-                f"F1_Sum={test_res['f1_sum_score']:.2f}  Recall_Sum={test_res['randomness_metric']:.2f}  "
-                f"Macro_F1={test_res['macro_f1']:.4f}  Acc={test_res['accuracy']:.4f}  "
-                f"Best_F1_Sum={best_f1_sum_score:.2f}")
-        
-        if early_counter >= args.patience:
-            log(f"[Early Stop] Triggered at epoch {epoch}")
-            break
+        if args.debug or epoch%5==0: log(f"[Epoch {epoch}] {dt:.1f}s F1_Sum={test_res['f1_sum_score']:.2f} Best={best_f1_sum_score:.2f}")
+        if tracker: tracker.log_measurement(f"epoch_{epoch}_complete", f"F1_Sum={test_res['f1_sum_score']:.2f}")
+        if early_counter >= args.patience: log(f"[Early Stop] epoch {epoch}"); break
     
     metrics["total_time"] = sum(metrics["epoch_times"])
-    metrics["time_per_epoch"] = np.mean(metrics["epoch_times"]) if metrics["epoch_times"] else 0
     
-    # Final inference with best model
-    if not args.debug and os.path.exists(best_model_path):
-        checkpoint = torch.load(best_model_path, map_location=device, weights_only=True)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        
-        final_results = run_inference(model, test_generator, device, args.debug)
-        metrics["num_events_evaluated"] = len(final_results)
-        
+    if os.path.exists(best_model_path):
+        ckpt = torch.load(best_model_path, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt["model_state_dict"])
         model_base = os.path.splitext(model_name)[0]
         parquet_path = os.path.join(args.save_dir, f"results_{model_base}.parquet")
-        save_results_to_parquet(final_results, parquet_path, model_base, cluster_info)
-        metrics["parquet_results_path"] = parquet_path
         
-        save_pickle(metrics, metrics_path)
-        log(f"📊 Metrics saved to: {metrics_path}")
+        _, final_metrics = run_inference(
+            model, test_generator, device,
+            criterion=nn.CrossEntropyLoss(),
+            num_classes=5,
+            debug=args.debug, show_progress=True,
+            save_path=parquet_path, model_name=model_base
+        )
+
+        if final_metrics and final_metrics.get("accuracy", 0) > 0 and sum(final_metrics.get("class_totals", [])) > 0:
+            metrics["final_inference_metrics"] = final_metrics  # keep as a separate, clearly-labeled record
+        else:
+            log("⚠️ Final inference pass produced no labeled samples — keeping training-loop best_* metrics unchanged")
+        
+        metrics["num_events_evaluated"] = len(test_generator); metrics["parquet_results_path"] = parquet_path
+        save_pickle(metrics, metrics_path); log(f"📊 Metrics saved: {metrics_path}")
     
     return metrics, model, best_model_path
+
 
 # ============================================================================
 # SINGLE MODEL TRAINING
 # ============================================================================
 
-def train_single_model(args, model_type: str = None) -> Tuple[Dict, str]:
-    """Train a single model with the given configuration."""
+def train_single_model(args, model_type=None, tracker=None):
+    model_name_used = model_type or args.model
     
-    # Determine model type
-    if model_type is not None:
-        model_name_used = model_type
-    else:
-        model_name_used = args.model
-    
-    # Set device
     if args.gpu >= 0 and torch.cuda.is_available():
-        device = torch.device(f"cuda:{args.gpu}")
-        torch.cuda.set_device(args.gpu)
-        log(f"🎯 Using GPU {args.gpu}: {torch.cuda.get_device_name(args.gpu)}")
+        device = torch.device(f"cuda:{args.gpu}"); torch.cuda.set_device(args.gpu)
+        log(f"🎯 GPU {args.gpu}: {torch.cuda.get_device_name(args.gpu)}")
     else:
-        device = torch.device("cpu")
-        log("🎯 Using CPU")
+        device = torch.device("cpu"); log("🎯 CPU")
+    if tracker: tracker.log_measurement("device_set")
     
-    # Load features with selection
-    features_dict, unscaled_dict, pairs, labels, cluster_info, input_dim, feature_names = \
-        load_features_with_selection(args.data_dir, args)
+    features_dict, _, pairs, labels, cluster_info, input_dim, feature_names = load_features_with_selection(args.data_dir, args, tracker)
     
-    # Create experiment name
-    if args.exp_name:
-        exp_name = args.exp_name
-    else:
-        feature_mode = "baseline" if args.baseline else "all"
-        exp_name = f"{model_name_used}_{feature_mode}_h{args.hidden_dim}_l{args.layers}"
-        if model_name_used in ['gat', 'transformer']:
-            exp_name += f"_heads{args.heads}"
-        if args.weighted_loss:
-            exp_name += f"_{args.weight_strategy}"
-    
+    exp_name = args.exp_name or f"{model_name_used}_{'baseline' if not args.all_features else 'all'}_h{args.hidden_dim}_l{args.layers}"
+    if model_name_used in ['gat','transformer']: exp_name += f"_heads{args.heads}"
+    if args.weighted_loss: exp_name += f"_{args.weight_strategy}"
     model_filename = f"{exp_name}.pt"
     
-    log("\n" + "="*60)
-    log(f"🔬 EXPERIMENT: {exp_name}")
-    log("="*60)
-    log(f"   Model: {model_name_used.upper()}")
-    if len(feature_names) > 5:
-        log(f"   Features: {input_dim} ({feature_names[:5]}...)")
-    else:
-        log(f"   Features: {input_dim} ({feature_names})")
-    log(f"   Hidden dim: {args.hidden_dim}")
-    log(f"   Layers: {args.layers}")
-    if model_name_used in ['gat', 'transformer']:
-        log(f"   Attention heads: {args.heads}")
-    log(f"   Dropout: {args.dropout}")
-    log(f"   Learning rate: {args.lr}")
-    log(f"   Weight decay: {args.weight_decay}")
-    log(f"   Train ratio: {args.train_ratio}")
-    log("="*60)
+    log(f"\n{'='*60}\n🔬 EXPERIMENT: {exp_name}\n{'='*60}")
+    log(f"   Model: {model_name_used.upper()} | Features: {input_dim} | Hidden: {args.hidden_dim} | Layers: {args.layers}")
     
-    # Create loss function
     criterion = create_loss_function(args, labels, device)
+    model = GraphFoundationModel(input_dim, args.hidden_dim, 5, device, model_name_used, args.layers,
+                                 args.heads, args.dropout, args.layer_weights, args.softmax_weights, args.norm, args.debug).to(device)
+    log(f"   Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    if tracker: tracker.log_measurement("model_created")
     
-    # Create model
-    model = GraphFoundationModel(
-        input_dim=input_dim,
-        hidden_dim=args.hidden_dim,
-        output_dim=5,
-        device=device,
-        model_type=model_name_used,
-        num_layers=args.layers,
-        num_heads=args.heads,
-        dropout=args.dropout,
-        layer_weights=args.layer_weights,
-        softmax_weights=args.softmax_weights,
-        norm_type=args.norm,
-        debug=args.debug
-    ).to(device)
-    
-    # Count parameters
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log(f"   Trainable parameters: {num_params:,}")
-    
-    # ============ INFERENCE-ONLY MODE ============
+    # ---- INFERENCE-ONLY MODE (FIX #1: Single forward pass) ----
     if args.inference_only:
-        log("\n" + "="*60)
-        log("🔮 INFERENCE-ONLY MODE")
-        log("="*60)
-        
-        # Find best model
+        log(f"\n{'='*60}\n🔮 INFERENCE-ONLY MODE\n{'='*60}")
         best_model_path = os.path.join(args.save_dir, f"best_{model_filename}")
         if not os.path.exists(best_model_path):
-            log(f"❌ Best model not found: {best_model_path}")
-            log("   Looking for any checkpoint...")
             chk = find_latest_checkpoint(args.save_dir, model_filename)
-            if chk:
-                _, best_model_path = chk
-                log(f"   Using checkpoint: {best_model_path}")
-            else:
-                log("❌ No checkpoint found. Cannot run inference-only.")
-                return None, None
+            if chk: best_model_path = chk[1]
+            else: log("❌ No checkpoint found."); return None, None
         
-        # Load best model
-        log(f"📂 Loading model: {best_model_path}")
-        checkpoint = torch.load(best_model_path, map_location=device, weights_only=True)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
-        
-        epoch_loaded = checkpoint.get('epoch', 'unknown')
-        log(f"   Loaded model from epoch {epoch_loaded}")
-        
-        # Create test generator
-        gen_kwargs = {
-            'features_dict': features_dict,
-            'neighbor_pairs': pairs,
-            'labels': labels,
-            'unscaled_data_dict': unscaled_dict,
-            'cluster_info_dict': cluster_info,
-            'debug': args.debug,
-            'is_bi_directional': True,
-            'train_ratio': args.train_ratio,
-        }
-        test_generator = MultiClassBatchGenerator(mode='test', **gen_kwargs)
-        
-        # Create DataLoader for evaluation
-        test_loader = DataLoader(
-            test_generator,
-            batch_size=args.batch_size,
-            collate_fn=MultiClassBatchGenerator.collate_data,
-            pin_memory=True,
-            num_workers=0
-        )
-        
-        # Create criterion (needed for loss in evaluate, but we only care about metrics)
-        criterion = nn.CrossEntropyLoss()
-        
-        # ===== RUN EVALUATION WITH COMPREHENSIVE METRICS =====
-        log("\n🔮 Running evaluation on test set...")
-        t0 = time.perf_counter()
-        test_res = evaluate(model, test_loader, criterion, device, use_amp=False)
-        elapsed = time.perf_counter() - t0
-        log(f"   ✅ Evaluation complete in {elapsed:.1f}s")
-        
-        # ===== ALSO RUN PER-EVENT INFERENCE FOR PARQUET =====
-        log("\n💾 Running per-event inference for Parquet export...")
-        final_results = run_inference(model, test_generator, device, args.debug, show_progress=True)
-        
-        # ===== SAVE PARQUET =====
+        ckpt = torch.load(best_model_path, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt['model_state_dict']); model.eval()
         model_base = os.path.splitext(model_filename)[0]
         parquet_path = os.path.join(args.save_dir, f"results_{model_base}.parquet")
-        save_results_to_parquet(final_results, parquet_path, model_base, cluster_info)
         
-        # ===== CREATE COMPREHENSIVE METRICS (WITH ARGS!) =====
-        metrics = {
-            'best_epoch': epoch_loaded,
-            'best_accuracy': test_res['accuracy'],
-            'best_macro_recall': test_res['macro_recall'],
-            'best_macro_precision': test_res['macro_precision'],
-            'best_macro_f1': test_res['macro_f1'],
-            'best_weighted_recall': test_res['weighted_recall'],
-            'best_weighted_precision': test_res['weighted_precision'],
-            'best_weighted_f1': test_res['weighted_f1'],
-            'best_randomness_metric': test_res['randomness_metric'],
-            'best_f1_sum_score': test_res['f1_sum_score'],
-            'best_weighted_recall_score': test_res['weighted_recall_score'],
-            'best_weighted_f1_score': test_res['weighted_f1_score'],
-            'num_events_evaluated': len(final_results),
-            'parquet_results_path': parquet_path,
-            'model_path': best_model_path,
-            # ===== CRITICAL: Save args so comparison script knows architecture & loss =====
-            'args': vars(args),
-        }
+        gen_kwargs = {'features_dict': features_dict, 'neighbor_pairs': pairs, 'labels': labels,
+                      'unscaled_data_dict': None, 'cluster_info_dict': cluster_info,
+                      'debug': args.debug, 'is_bi_directional': True,
+                      'train_ratio': 0.0,  # all events go to test
+                      'chunk_size': 2000, 'inference_only': True}
+        test_generator = MultiClassBatchGenerator(mode='test', **gen_kwargs)
         
-        # Add per-class metrics
+        # FIX #1: Single pass — run_inference computes metrics inline, no separate evaluate() call
+        _, test_metrics = run_inference(
+            model, test_generator, device,
+            criterion=nn.CrossEntropyLoss(),  # pass criterion for inline metrics
+            num_classes=5,
+            debug=args.debug, show_progress=True,
+            save_path=parquet_path, model_name=model_base
+        )
+        
+        if test_metrics is None:
+            log("❌ Inference produced no metrics")
+            return None, None
+        
+        metrics = {'best_epoch': ckpt.get('epoch', '?'),
+                   'best_accuracy': test_metrics['accuracy'],
+                   'best_macro_f1': test_metrics['macro_f1'],
+                   'best_f1_sum_score': test_metrics['f1_sum_score'],
+                   'best_randomness_metric': test_metrics['randomness_metric'],
+                   'parquet_results_path': parquet_path,
+                   'model_path': best_model_path,
+                   'args': vars(args)}
         for c in range(5):
-            metrics[f'test_recall_class_{c}'] = [test_res.get(f'recall_class_{c}', 0.0)]
-            metrics[f'test_precision_class_{c}'] = [test_res.get(f'precision_class_{c}', 0.0)]
-            metrics[f'test_f1_class_{c}'] = [test_res.get(f'f1_class_{c}', 0.0)]
-        
-        # Save PKL
-        metrics_path = os.path.join(args.save_dir, f"{model_base}_metrics.pkl")
-        
-        # Merge with existing metrics if available
-        if os.path.exists(metrics_path):
-            try:
-                with open(metrics_path, 'rb') as f:
-                    existing_metrics = pickle.load(f)
-                for key in metrics:
-                    existing_metrics[key] = metrics[key]
-                metrics = existing_metrics
-            except:
-                pass
-        
-        save_pickle(metrics, metrics_path)
-        
-        # ===== SUMMARY =====
-        log("\n" + "="*60)
-        log("✅ INFERENCE COMPLETE!")
-        log("="*60)
-        log(f"   Accuracy:           {test_res['accuracy']:.4f}")
-        log(f"   Macro F1:           {test_res['macro_f1']:.4f}")
-        log(f"   Macro Recall:       {test_res['macro_recall']:.4f}")
-        log(f"   Macro Precision:    {test_res['macro_precision']:.4f}")
-        log(f"   F1 Sum Score (FSS): {test_res['f1_sum_score']:.2f}  (1.0=random, 5.0=perfect)")
-        log(f"   Recall Sum (RSS):   {test_res['randomness_metric']:.2f}  (1.0=random, 5.0=perfect)")
-        log(f"   Weighted F1 (WFSS): {test_res['weighted_f1_score']:.2f}")
-        log(f"")
-        log(f"   Per-Class Breakdown:")
-        for c in range(5):
-            rec = test_res.get(f'recall_class_{c}', 0.0)
-            prec = test_res.get(f'precision_class_{c}', 0.0)
-            f1c = test_res.get(f'f1_class_{c}', 0.0)
-            log(f"     Class {c}: Recall={rec:.4f}, Precision={prec:.4f}, F1={f1c:.4f}")
-        log(f"\n   Parquet saved to: {parquet_path}")
-        log(f"   Metrics saved to: {metrics_path}")
-        log("="*60)
-        
+            for m in ['recall', 'precision', 'f1']:
+                metrics[f'test_{m}_class_{c}'] = [test_metrics.get(f'{m}_class_{c}', 0.0)]
+        save_pickle(metrics, os.path.join(args.save_dir, f"{model_base}_metrics.pkl"))
+        log(f"\n✅ INFERENCE COMPLETE! F1_Sum: {test_metrics['f1_sum_score']:.2f} | Parquet: {parquet_path}")
         return metrics, best_model_path
-
-    # Normal training mode
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay
-    )
-
-    # Scaler for mixed precision
-    if args.mixed_precision and args.gpu >= 0:
-        scaler = torch.amp.GradScaler('cuda')
-        log("✅ Mixed precision enabled - using FP16 with GradScaler")
-    else:
-        scaler = None
-        log("✅ Mixed precision disabled - using FP32")   
-   
-    # Generator kwargs
-    gen_kwargs = {
-        'features_dict': features_dict,
-        'neighbor_pairs': pairs,
-        'labels': labels,
-        'unscaled_data_dict': unscaled_dict,
-        'cluster_info_dict': cluster_info,
-        'debug': args.debug,
-        'is_bi_directional': True,
-        'train_ratio': args.train_ratio,
-    }
     
-    # Create generators and loaders
+    # ---- NORMAL TRAINING MODE ----
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.amp.GradScaler('cuda') if (args.mixed_precision and args.gpu>=0 and torch.cuda.is_available()) else None
+    log(f"✅ {'FP16' if scaler else 'FP32'}")
+    
+    gen_kwargs = {'features_dict': features_dict, 'neighbor_pairs': pairs, 'labels': labels,
+                  'unscaled_data_dict': None, 'cluster_info_dict': cluster_info,
+                  'debug': args.debug, 'is_bi_directional': True, 'train_ratio': args.train_ratio,
+                  'chunk_size': 2000, 'inference_only': False}
     train_generator = MultiClassBatchGenerator(mode='train', **gen_kwargs)
     test_generator = MultiClassBatchGenerator(mode='test', **gen_kwargs)
     
-    train_loader = DataLoader(
-        train_generator,
-        batch_size=args.batch_size,
-        collate_fn=MultiClassBatchGenerator.collate_data,
-        pin_memory=True,
-        num_workers=0  # Keep at 0 due to CUDA multiprocessing issues
-    )
+    train_loader = DataLoader(train_generator, batch_size=args.batch_size,
+                              collate_fn=MultiClassBatchGenerator.collate_data, pin_memory=True, num_workers=0)
+    test_loader = DataLoader(test_generator, batch_size=args.batch_size,
+                             collate_fn=MultiClassBatchGenerator.collate_data, pin_memory=True, num_workers=0)
+    if tracker: tracker.log_measurement("data_loaders_ready")
     
-    test_loader = DataLoader(
-        test_generator,
-        batch_size=args.batch_size,
-        collate_fn=MultiClassBatchGenerator.collate_data,
-        pin_memory=True,
-        num_workers=0
-    )
+    metrics, model, model_path = train_model_full(model, train_loader, test_loader, test_generator,
+                                                   optimizer, criterion, scaler, device, args, model_filename, cluster_info, tracker)
     
-    # Train
-    metrics, model, model_path = train_model_full(
-        model=model,
-        train_loader=train_loader,
-        test_loader=test_loader,
-        test_generator=test_generator,
-        optimizer=optimizer,
-        criterion=criterion,
-        scaler=scaler,
-        device=device,
-        args=args,
-        model_name=model_filename,
-        cluster_info=cluster_info
-    )
-    
-    # Summary
-    log("\n" + "="*60)
-    log("🏁 TRAINING SUMMARY")
-    log("="*60)
-    log(f"   Best epoch: {metrics['best_epoch']}")
-    log(f"   Best ACCURACY: {metrics['best_accuracy']:.4f}")
-    log(f"   Best MACRO F1: {metrics['best_macro_f1']:.4f}")
-    log(f"   Best MACRO RECALL: {metrics['best_macro_recall']:.4f}")
-    log(f"   Best MACRO PRECISION: {metrics['best_macro_precision']:.4f}")
-    log(f"   Best WEIGHTED F1: {metrics['best_weighted_f1']:.4f}")
-    log(f"")
-    log(f"   Best F1 SUM SCORE (FSS): {metrics['best_f1_sum_score']:.2f}  (1.0=random, 5.0=perfect)")
-    log(f"   Best RECALL SUM SCORE (RSS): {metrics['best_randomness_metric']:.2f}  (1.0=random, 5.0=perfect)")
-    log(f"   Best WEIGHTED F1 SCORE (WFSS): {metrics['best_weighted_f1_score']:.2f}")
-    log(f"")
-    log(f"   Best per-class metrics:")
-    for c in range(5):
-        recall_c = max(metrics.get(f'test_recall_class_{c}', [0]))
-        prec_c = max(metrics.get(f'test_precision_class_{c}', [0]))
-        f1_c = max(metrics.get(f'test_f1_class_{c}', [0]))
-        log(f"     Class {c}: Recall={recall_c:.4f}, Precision={prec_c:.4f}, F1={f1_c:.4f}")
-    log(f"\n   Best test loss: {metrics['best_test_loss']:.6f}")
+    log(f"\n{'='*60}\n🏁 TRAINING SUMMARY\n{'='*60}")
+    log(f"   Best epoch: {metrics['best_epoch']} | F1_Sum: {metrics['best_f1_sum_score']:.2f} | Accuracy: {metrics['best_accuracy']:.4f}")
     log(f"   Total time: {metrics['total_time']/60:.1f} min")
-    log(f"   Model saved to: {model_path}")
-    if 'parquet_results_path' in metrics:
-        log(f"   Results saved to: {metrics['parquet_results_path']}")
-    log("="*60)
-
+    if tracker: tracker.log_measurement("training_complete"); tracker.print_summary(); tracker.save_report(f"resource_report_{exp_name}.json")
     return metrics, model_path
-
-# ============================================================================
-# CONVERSION FUNCTION
-# ============================================================================
-
-def convert_results(pickle_path: str) -> None:
-    """Convert old pickle results to new Parquet format."""
-    log(f"Converting {pickle_path} to Parquet format...")
-    
-    # Load pickle
-    with open(pickle_path, 'rb') as f:
-        data = pickle.load(f)
-    
-    # Extract results
-    if 'final_results_per_event' in data:
-        results = data['final_results_per_event']
-    else:
-        results = data
-    
-    # Convert to DataFrame
-    all_dfs = []
-    for result in results:
-        num_edges = len(result.get('preds', []))
-        if num_edges == 0:
-            continue
-            
-        df = pd.DataFrame({
-            'event_id': result.get('event_id', 0),
-            'pred_label': result.get('preds', []),
-            'true_label': result.get('labels', []) if result.get('labels') is not None else -1,
-        })
-        all_dfs.append(df)
-    
-    if all_dfs:
-        final_df = pd.concat(all_dfs, ignore_index=True)
-        output_path = pickle_path.replace('.pkl', '.parquet').replace('.pickle', '.parquet')
-        final_df.to_parquet(output_path, compression='snappy')
-        log(f"✅ Converted to: {output_path}")
-        log(f"   Total edges: {len(final_df):,}")
-    else:
-        log("❌ No results found to convert")
 
 
 # ============================================================================
@@ -1983,77 +1847,31 @@ def convert_results(pickle_path: str) -> None:
 # ============================================================================
 
 def main():
-    """Main entry point."""
     args = parse_args()
+    log(f"{'='*70}\n🚀 GRAPH FOUNDATION MODEL (CUDA)\n{'='*70}")
+    log(f"Model: {args.model.upper()} | Features: {'ALL (42+)' if args.all_features else 'BASELINE (3)'}")
+    log(f"Hidden: {args.hidden_dim} | Layers: {args.layers} | GPU: {args.gpu}")
     
-    log("="*70)
-    log("🚀 GRAPH FOUNDATION MODEL FOR PARTICLE PHYSICS")
-    log("="*70)
-    log(f"Model: {args.model.upper()}")
-    log(f"Features: {'BASELINE (3)' if args.baseline else 'ALL (42+)'}")
-    log(f"Hidden dim: {args.hidden_dim}, Layers: {args.layers}")
-    log(f"GPU: {args.gpu if args.gpu >= 0 else 'CPU'}")
-    log("="*70)
+    tracker = ResourceTracker(log_dir=args.save_dir, enabled=args.track_resources)
+    if args.track_resources: tracker.start()
+    
+    if args.analyze_scalability:
+        analyze_dataset_scalability(args.data_dir)
+        if tracker: tracker.save_report("scalability_report.json")
+        return
     
     if args.model == 'all':
-        # Train all architectures sequentially
-        architectures = ['gcn', 'gat', 'transformer', 'sage']
-        log(f"\n🔄 Training all architectures: {architectures}")
-        
-        results = {}
-        for arch in architectures:
-            log(f"\n{'='*60}")
-            log(f"Training {arch.upper()}...")
-            log('='*60)
-            
-            try:
-                metrics, model_path = train_single_model(args, model_type=arch)
-                results[arch] = {
-                    'best_acc': metrics['best_test_acc'],
-                    'model_path': model_path
-                }
-                log(f"✅ {arch.upper()} completed! Best acc: {metrics['best_test_acc']:.4f}")
-            except Exception as e:
-                log(f"❌ {arch.upper()} failed: {e}")
-                traceback.print_exc()
-            
-            # Clear GPU memory
-            torch.cuda.empty_cache()
-            time.sleep(5)
-        
-        # Summary
-        log("\n" + "="*60)
-        log("📊 ALL MODELS SUMMARY")
-        log("="*60)
-        for arch, res in results.items():
-            log(f"   {arch.upper()}: Best acc = {res['best_acc']:.4f}")
-        log("="*60)
-        
+        for arch in ['gcn','gat','transformer','sage']:
+            log(f"\n{'='*60}\nTraining {arch.upper()}...")
+            try: train_single_model(args, arch, tracker)
+            except Exception as e: log(f"❌ {arch} failed: {e}"); traceback.print_exc()
+            torch.cuda.empty_cache(); gc.collect()
     else:
-        # Train single architecture
-        try:
-            metrics, model_path = train_single_model(args)
-            log(f"\n✅ Training completed!")
-        except Exception as e:
-            log(f"❌ Training failed: {e}")
-            traceback.print_exc()
-            sys.exit(1)
+        try: train_single_model(args, tracker=tracker)
+        except Exception as e: log(f"❌ Failed: {e}"); traceback.print_exc(); sys.exit(1)
     
-    log("\n" + "="*70)
-    log("🎉 PIPELINE COMPLETE!")
-    log("="*70)
-
-
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
+    if tracker: tracker.print_summary(); tracker.save_report("final_resource_report.json")
+    log(f"\n{'='*70}\n🎉 PIPELINE COMPLETE!\n{'='*70}")
 
 if __name__ == "__main__":
-    # Check for convert mode
-    if len(sys.argv) > 1 and sys.argv[1] == 'convert':
-        if len(sys.argv) < 3:
-            print("Usage: python3 new_RunningMultipleModels.py convert path/to/results.pkl")
-            sys.exit(1)
-        convert_results(sys.argv[2])
-    else:
-        main()
+    main()
