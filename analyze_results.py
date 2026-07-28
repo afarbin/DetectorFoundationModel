@@ -1,4 +1,3 @@
-```python
 #!/usr/bin/env python3
 """
 analyze_results.py - Comprehensive Model Analysis for CaloGraphNet
@@ -83,6 +82,7 @@ def create_output_structure(output_dir):
         'confusion_matrices': os.path.join(output_dir, 'figures', 'confusion_matrices'),
         'comparison_plots': os.path.join(output_dir, 'figures', 'comparison_plots'),
         'metrics_radar': os.path.join(output_dir, 'figures', 'metrics_radar'),
+        'loss_curves': os.path.join(output_dir, 'figures', 'loss_curves'),
         'tables': os.path.join(output_dir, 'tables'),
         'reports': os.path.join(output_dir, 'reports'),
         'data': os.path.join(output_dir, 'data'),
@@ -122,6 +122,12 @@ def extract_model_metrics(metrics):
         
         # Accuracy
         'accuracy': metrics.get('best_accuracy', 0.0),
+
+        # Loss data
+        'train_losses': metrics.get('train_losses', []),
+        'val_losses': metrics.get('val_losses', []),
+        'test_losses': metrics.get('test_losses', []),
+        'test_epochs': metrics.get('test_epochs', []),
         
         # Training info
         'best_epoch': metrics.get('best_epoch', '?'),
@@ -361,6 +367,139 @@ def plot_pr_curves(model_name, extracted, folders, class_names, class_colors, ma
     del y_true, y_scores, y_true_bin
     gc.collect()
     print(f"   Done: PR curves saved (Mean AP: {np.mean(all_aps):.3f})")
+
+
+def plot_loss_curves(model_name, metrics, folders):
+    """Generate training and testing loss curves."""
+    print(f"      Plotting loss curves...")
+    
+    # Check if loss data exists
+    train_losses = metrics.get('train_losses', [])
+    val_losses = metrics.get('val_losses', [])
+    test_losses = metrics.get('test_losses', [])
+    
+    if not train_losses and not val_losses and not test_losses:
+        print("      No loss data available")
+        return
+    
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    
+    # Training loss
+    ax1 = axes[0]
+    
+    if train_losses:
+        epochs = range(1, len(train_losses) + 1)
+        ax1.plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2)
+        if val_losses:
+            ax1.plot(epochs, val_losses, 'r-', label='Validation Loss', linewidth=2)
+        ax1.set_xlabel('Epoch', fontsize=12)
+        ax1.set_ylabel('Loss', fontsize=12)
+        ax1.set_title(f'Training and Validation Loss - {model_name}', fontsize=14, fontweight='bold')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Mark best epoch
+        best_epoch = metrics.get('best_epoch', 0)
+        if isinstance(best_epoch, int) and best_epoch > 0 and best_epoch <= len(train_losses):
+            best_val_loss = val_losses[best_epoch - 1] if val_losses else None
+            ax1.axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7, 
+                       label=f'Best Epoch: {best_epoch}')
+            if best_val_loss is not None:
+                ax1.scatter(best_epoch, best_val_loss, color='green', s=100, zorder=5)
+    
+    # Testing loss (if available)
+    ax2 = axes[1]
+    test_losses = metrics.get('test_losses', [])
+    test_epochs = metrics.get('test_epochs', [])
+    
+    if test_losses:
+        if not test_epochs:
+            test_epochs = range(1, len(test_losses) + 1)
+        ax2.plot(test_epochs, test_losses, 'g-', label='Test Loss', linewidth=2, marker='o')
+        ax2.set_xlabel('Epoch', fontsize=12)
+        ax2.set_ylabel('Loss', fontsize=12)
+        ax2.set_title(f'Test Loss - {model_name}', fontsize=14, fontweight='bold')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # Add annotations for min test loss
+        if test_losses:
+            min_idx = np.argmin(test_losses)
+            min_loss = test_losses[min_idx]
+            min_epoch = test_epochs[min_idx] if test_epochs else min_idx + 1
+            ax2.scatter(min_epoch, min_loss, color='red', s=100, zorder=5)
+            ax2.annotate(f'Min: {min_loss:.4f}', 
+                        xy=(min_epoch, min_loss),
+                        xytext=(10, 10), textcoords='offset points',
+                        fontweight='bold')
+    else:
+        # If no test losses, show training loss details
+        if train_losses:
+            epochs = range(1, len(train_losses) + 1)
+            ax2.plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2)
+            ax2.set_xlabel('Epoch', fontsize=12)
+            ax2.set_ylabel('Loss', fontsize=12)
+            ax2.set_title(f'Training Loss Details - {model_name}', fontsize=14, fontweight='bold')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(folders['loss_curves'], f"{model_name}_loss_curves.png"), 
+                dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"      Done: Loss curves saved")
+
+
+def plot_loss_comparison(all_results, folders):
+    """Create a comparison of loss curves for top models."""
+    print("      Creating loss comparison plot...")
+    
+    # Get top 5 models
+    top_models = sorted(all_results, key=lambda x: x['f1_sum_score'], reverse=True)[:5]
+    
+    if not top_models or not any(m.get('train_losses') for m in top_models):
+        print("      No loss data available for comparison")
+        return
+    
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+    
+    # Training loss comparison
+    ax1 = axes[0]
+    colors = plt.cm.Set1(np.linspace(0, 1, len(top_models)))
+    
+    for idx, model in enumerate(top_models):
+        train_losses = model.get('train_losses', [])
+        if train_losses:
+            epochs = range(1, len(train_losses) + 1)
+            ax1.plot(epochs, train_losses, '-', color=colors[idx], 
+                    linewidth=1.5, alpha=0.7, label=model['name'][:25])
+    
+    ax1.set_xlabel('Epoch', fontsize=12)
+    ax1.set_ylabel('Training Loss', fontsize=12)
+    ax1.set_title('Training Loss Comparison (Top 5 Models)', fontsize=14, fontweight='bold')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Validation loss comparison
+    ax2 = axes[1]
+    for idx, model in enumerate(top_models):
+        val_losses = model.get('val_losses', [])
+        if val_losses:
+            epochs = range(1, len(val_losses) + 1)
+            ax2.plot(epochs, val_losses, '-', color=colors[idx], 
+                    linewidth=1.5, alpha=0.7, label=model['name'][:25])
+    
+    ax2.set_xlabel('Epoch', fontsize=12)
+    ax2.set_ylabel('Validation Loss', fontsize=12)
+    ax2.set_title('Validation Loss Comparison (Top 5 Models)', fontsize=14, fontweight='bold')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(folders['loss_curves'], "loss_comparison.png"), 
+                dpi=150, bbox_inches='tight')
+    plt.close()
+    print("   Done: Loss comparison plot saved")
 
 
 def plot_confusion_matrix_enhanced(model_name, extracted, folders, class_names, class_colors, max_rows, batch_size):
@@ -619,6 +758,17 @@ def generate_html_report(all_results, df_display, folders, class_names, datetime
         </div>
         
         <div class="container">
+            <h2>Loss Curves Comparison</h2>
+            <p style="color: #555; margin-bottom: 20px;">
+                Training and validation loss curves showing model convergence across top models.
+            </p>
+            <img src="../figures/loss_curves/loss_comparison.png" alt="Loss Comparison" style="max-width: 100%;">
+            <p style="margin-top: 15px; color: #999; font-size: 0.9em;">
+                Individual model loss curves are available in the figures/loss_curves/ directory.
+            </p>
+        </div>
+        
+        <div class="container">
             <h2>Comprehensive Metrics Comparison</h2>
             <img src="../figures/comparison_plots/comprehensive_metrics.png" alt="Comprehensive Metrics">
         </div>
@@ -715,6 +865,7 @@ def main():
             plot_roc_curves(model_name, extracted, folders, CLASS_NAMES, CLASS_COLORS)
             plot_pr_curves(model_name, extracted, folders, CLASS_NAMES, CLASS_COLORS, 
                           args.max_rows_roc, args.batch_size)
+            plot_loss_curves(model_name, metrics, folders)
             plot_confusion_matrix_enhanced(model_name, extracted, folders, CLASS_NAMES, CLASS_COLORS,
                                           args.max_rows_confusion, args.batch_size)
             
@@ -735,6 +886,7 @@ def main():
     
     plot_radar_chart(all_results, folders, args.top_n)
     plot_metric_comparison(all_results, folders, CLASS_NAMES)
+    plot_loss_comparison(all_results, folders)
     
     print("\n" + "="*100)
     print("PHASE 3: Generating Tables and Reports")
