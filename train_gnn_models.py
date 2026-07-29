@@ -262,6 +262,14 @@ def parse_args():
     parser.add_argument('--analyze-scalability', action='store_true')
     parser.add_argument('--track-resources', action='store_true', default=True)
     parser.add_argument('--no-track-resources', action='store_false', dest='track_resources')
+    parser.add_argument('--pretrain', action='store_true', help='Enable masked pretraining mode')
+    parser.add_argument('--mask-type', type=str, default='random', choices=['random', 'feature', 'geometry', 'cluster'], help='Type of masking strategy')
+    parser.add_argument('--mask-ratio', type=float, default=0.15, help='Fraction of cells/features to mask')
+    parser.add_argument('--mask-features', type=str, nargs='+', default=None, help='Specific features to mask (for feature masking)')
+    parser.add_argument('--geometry-radius', type=int, default=2, help='Radius for geometry masking')
+    parser.add_argument('--pretrain-epochs', type=int, default=100, help='Number of pretraining epochs')
+    parser.add_argument('--finetune-epochs', type=int, default=30, help='Number of finetuning epochs (after pretraining)')
+    parser.add_argument('--continuous-loss', type=str, default='mse', choices=['mse', 'l1'], help='Loss function for continuous features')
     return parser.parse_args()
 
 
@@ -343,6 +351,211 @@ def analyze_dataset_scalability(data_dir: str) -> Dict:
             if f'{scale}_events_gb' in results['scalability']:
                 log(f"   {scale:,} events: {results['scalability'][f'{scale}_events_gb']:.1f} GB")
     return results
+
+# ============================================================================
+# MASKING FUNCTIONS FOR PRETRAINING
+# ============================================================================
+
+class CalorimeterMasking:
+    """
+    Implements various masking strategies for calorimeter cell graphs.
+    
+    Supports:
+    - Random cell masking (like BERT)
+    - Feature masking (mask specific features)
+    - Geometry masking (mask contiguous regions)
+    - Cluster masking (mask entire topo-clusters)
+    """
+    
+    def __init__(self, mask_ratio=0.15, mask_type='random', 
+                 mask_features=None, cells_array=None, 
+                 cluster_info_dict=None, geometry_radius=2):
+        """
+        Args:
+            mask_ratio: Fraction of cells/features to mask (0.0 to 1.0)
+            mask_type: 'random', 'feature', 'geometry', 'cluster'
+            mask_features: List of feature names to mask (for feature masking)
+            cells_array: numpy structured array with cell positions (eta, phi)
+            cluster_info_dict: Dict mapping event_id -> cluster_index array
+            geometry_radius: Number of hops for geometry masking
+        """
+        self.mask_ratio = mask_ratio
+        self.mask_type = mask_type
+        self.mask_features = mask_features or []
+        self.cells_array = cells_array
+        self.cluster_info_dict = cluster_info_dict or {}
+        self.geometry_radius = geometry_radius
+        
+        # Learnable mask token (initialized as zeros, can be made learnable)
+        self.mask_token_value = 0.0
+        
+    def _get_random_mask(self, num_cells: int, rng: np.random.RandomState) -> np.ndarray:
+        """Random cell masking - mask entire cells."""
+        mask = rng.random(num_cells) < self.mask_ratio
+        return mask
+    
+    def _get_feature_mask(self, num_cells: int, num_features: int, 
+                          feature_names: List[str], 
+                          rng: np.random.RandomState) -> np.ndarray:
+        """Feature masking - mask specific features across cells."""
+        # Create a boolean mask of shape (num_cells, num_features)
+        mask = np.zeros((num_cells, num_features), dtype=bool)
+        
+        if not self.mask_features:
+            # If no features specified, randomly choose features
+            n_features_to_mask = max(1, int(num_features * self.mask_ratio))
+            features_to_mask = rng.choice(num_features, n_features_to_mask, replace=False)
+        else:
+            # Map feature names to indices
+            features_to_mask = []
+            for fname in self.mask_features:
+                if fname in feature_names:
+                    features_to_mask.append(feature_names.index(fname))
+            if not features_to_mask:
+                # Fallback: mask a random feature
+                features_to_mask = [rng.randint(0, num_features)]
+        
+        # Mask the selected features for a subset of cells
+        cells_to_mask = rng.random(num_cells) < self.mask_ratio
+        for feat_idx in features_to_mask:
+            mask[cells_to_mask, feat_idx] = True
+            
+        return mask
+    
+    def _get_geometry_mask(self, num_cells: int, cell_positions: np.ndarray,
+                          rng: np.random.RandomState) -> np.ndarray:
+        """Geometry masking - mask cells in a contiguous spatial region."""
+        mask = np.zeros(num_cells, dtype=bool)
+        
+        # Choose a random seed cell
+        seed_cell = rng.randint(0, num_cells)
+        seed_eta = cell_positions[seed_cell, 0]
+        seed_phi = cell_positions[seed_cell, 1]
+        
+        # Mask cells within a certain eta-phi window
+        # Note: phi wrapping not handled here for simplicity
+        # In practice, you'd want proper angular distance
+        eta_window = 0.3 * self.geometry_radius  # Adjust window size
+        phi_window = 0.3 * self.geometry_radius
+        
+        for i in range(num_cells):
+            deta = abs(cell_positions[i, 0] - seed_eta)
+            dphi = abs(cell_positions[i, 1] - seed_phi)
+            # Handle phi wrapping
+            dphi = min(dphi, 2*np.pi - dphi)
+            
+            if deta < eta_window and dphi < phi_window:
+                # Only mask a fraction to avoid too easy reconstruction
+                if rng.random() < self.mask_ratio * 2:  # Higher probability in window
+                    mask[i] = True
+                    
+        return mask
+    
+    def _get_cluster_mask(self, num_cells: int, event_id: int,
+                         rng: np.random.RandomState) -> np.ndarray:
+        """Cluster masking - mask all cells belonging to selected clusters."""
+        mask = np.zeros(num_cells, dtype=bool)
+        
+        if event_id not in self.cluster_info_dict:
+            # Fallback to random masking
+            return self._get_random_mask(num_cells, rng)
+        
+        cluster_info = self.cluster_info_dict[event_id]
+        cluster_ids = cluster_info.get('cell_cluster_index', None)
+        
+        if cluster_ids is None:
+            return self._get_random_mask(num_cells, rng)
+        
+        # Get unique cluster IDs (excluding -1 for unclustered)
+        unique_clusters = np.unique(cluster_ids[cluster_ids >= 0])
+        
+        if len(unique_clusters) == 0:
+            return self._get_random_mask(num_cells, rng)
+        
+        # Select clusters to mask
+        n_clusters_to_mask = max(1, int(len(unique_clusters) * self.mask_ratio))
+        clusters_to_mask = rng.choice(unique_clusters, n_clusters_to_mask, replace=False)
+        
+        # Mask all cells in selected clusters
+        for cluster_id in clusters_to_mask:
+            mask[cluster_ids == cluster_id] = True
+            
+        return mask
+    
+    def apply_mask(self, features: torch.Tensor, event_id: int = None,
+                  feature_names: List[str] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Apply masking to node features.
+        
+        Args:
+            features: Node features tensor of shape (num_cells, num_features)
+            event_id: Event identifier (needed for cluster masking)
+            feature_names: List of feature names (needed for feature masking)
+            
+        Returns:
+            masked_features: Features with masked values replaced
+            mask: Boolean mask indicating which values were masked
+            targets: Original values for masked positions (for reconstruction loss)
+        """
+        rng = np.random.RandomState()
+        num_cells, num_features = features.shape
+        
+        if self.mask_type == 'random':
+            # Cell-level mask
+            cell_mask = self._get_random_mask(num_cells, rng)
+            # Expand to feature dimension
+            mask = np.tile(cell_mask[:, np.newaxis], (1, num_features))
+            
+        elif self.mask_type == 'feature':
+            # Feature-level mask
+            mask = self._get_feature_mask(num_cells, num_features, feature_names or [], rng)
+            
+        elif self.mask_type == 'geometry':
+            # Geometry-based mask
+            if self.cells_array is not None:
+                # Extract eta, phi positions
+                cell_positions = np.column_stack([
+                    self.cells_array['eta_event0'] if 'eta_event0' in self.cells_array.dtype.names 
+                    else self.cells_array['eta'],
+                    self.cells_array['phi_event0'] if 'phi_event0' in self.cells_array.dtype.names
+                    else self.cells_array['phi']
+                ])
+                cell_mask = self._get_geometry_mask(num_cells, cell_positions, rng)
+            else:
+                cell_mask = self._get_random_mask(num_cells, rng)
+            mask = np.tile(cell_mask[:, np.newaxis], (1, num_features))
+            
+        elif self.mask_type == 'cluster':
+            # Cluster-based mask
+            cell_mask = self._get_cluster_mask(num_cells, event_id or 0, rng)
+            mask = np.tile(cell_mask[:, np.newaxis], (1, num_features))
+            
+        else:
+            raise ValueError(f"Unknown mask type: {self.mask_type}")
+        
+        # Convert to tensors
+        mask = torch.from_numpy(mask).bool()
+        
+        # Store original values as targets (only for masked positions)
+        targets = features.clone()
+        
+        # Apply masking (replace with mask token value)
+        masked_features = features.clone()
+        masked_features[mask] = self.mask_token_value
+        
+        return masked_features, mask, targets
+    
+    def get_reconstruction_mask(self, mask: torch.Tensor, 
+                                targets: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get only the masked positions for loss computation.
+        
+        Returns:
+            masked_targets: Target values for masked positions
+            valid_mask: Boolean mask for positions to include in loss
+        """
+        # Only compute loss on masked positions
+        return targets[mask], mask
 
 # ============================================================================
 # FEATURE LOADING
@@ -605,145 +818,275 @@ def create_loss_function(args, labels, device):
 
 class GraphFoundationModel(nn.Module):
     """
-    Generic graph neural network for edge classification.
-
-    Supports multiple message-passing backbones (GCN, GAT, GraphSAGE,
-    TransformerConv) with optional learnable layer weighting.
+    Generic graph neural network for edge classification and masked pretraining.
+    
+    Supports:
+    - Multiple message-passing backbones (GCN, GAT, GraphSAGE, TransformerConv)
+    - Optional learnable layer weighting
+    - Masked pretraining with reconstruction head
+    - Downstream edge classification
     """
 
     def __init__(self, input_dim, hidden_dim, output_dim, device,
                  model_type='gcn', num_layers=6, num_heads=2,
                  dropout=0.0, layer_weights=False,
-                 softmax_weights=False, norm_type='batch', debug=False):
+                 softmax_weights=False, norm_type='batch', debug=False,
+                 pretraining=False, feature_names=None):
         super().__init__()
 
-        # Store model configuration.
+        # Store model configuration
         self.device = device
         self.model_type = model_type
         self.num_layers = num_layers
         self.layer_weights_enabled = layer_weights
         self.softmax = softmax_weights
+        self.pretraining = pretraining
+        self.feature_names = feature_names or []
 
-        # Project input node features into the hidden embedding space.
+        # Project input node features into the hidden embedding space
         self.node_embedding = nn.Linear(input_dim, hidden_dim)
 
-        # Construct the requested graph convolution backbone.
+        # Construct the requested graph convolution backbone
         self.convs = nn.ModuleList()
         for _ in range(num_layers):
             if model_type == 'gcn':
                 self.convs.append(GCNConv(hidden_dim, hidden_dim))
-
             elif model_type == 'gat':
                 self.convs.append(
-                    GATConv(
-                        hidden_dim,
-                        hidden_dim // num_heads,
-                        heads=num_heads,
-                        dropout=dropout
-                    )
+                    GATConv(hidden_dim, hidden_dim // num_heads,
+                           heads=num_heads, dropout=dropout)
                 )
-
             elif model_type == 'transformer':
                 self.convs.append(
-                    TransformerConv(
-                        hidden_dim,
-                        hidden_dim // num_heads,
-                        heads=num_heads,
-                        dropout=dropout
-                    )
+                    TransformerConv(hidden_dim, hidden_dim // num_heads,
+                                   heads=num_heads, dropout=dropout)
                 )
-
             elif model_type == 'sage':
                 self.convs.append(SAGEConv(hidden_dim, hidden_dim))
 
-        # Create a normalization layer after each graph convolution.
+        # Create normalization layers
         if norm_type == 'batch':
-            self.bns = nn.ModuleList(
-                [BatchNorm1d(hidden_dim) for _ in range(num_layers)]
-            )
-
+            self.bns = nn.ModuleList([BatchNorm1d(hidden_dim) for _ in range(num_layers)])
         elif norm_type == 'layer':
-            self.bns = nn.ModuleList(
-                [LayerNorm1d(hidden_dim) for _ in range(num_layers)]
-            )
-
+            self.bns = nn.ModuleList([LayerNorm1d(hidden_dim) for _ in range(num_layers)])
         else:
-            # No normalization.
-            self.bns = nn.ModuleList(
-                [nn.Identity() for _ in range(num_layers)]
+            self.bns = nn.ModuleList([nn.Identity() for _ in range(num_layers)])
+
+        # Task-specific heads
+        if pretraining:
+            # Reconstruction head for masked pretraining
+            self.reconstruction_head = FeatureReconstructionHead(
+                hidden_dim, input_dim,
+                feature_types=self._infer_feature_types()
             )
+            self.fc = None  # No classification head during pretraining
+        else:
+            # Edge classification head for downstream tasks
+            self.fc = nn.Linear(2 * hidden_dim, output_dim)
+            self.reconstruction_head = None
 
-        # Final classifier operating on concatenated source and destination
-        # node embeddings for each edge.
-        self.fc = nn.Linear(2 * hidden_dim, output_dim)
-
-        # Optional learnable weighting of each message-passing layer.
+        # Optional learnable weighting of each message-passing layer
         if layer_weights:
             self.layer_weights = nn.Parameter(torch.ones(num_layers))
 
         log(
             f"📐 Initialized {model_type.upper()} model: "
             f"input={input_dim}, hidden={hidden_dim}, layers={num_layers}"
+            f"{' [PRETRAINING]' if pretraining else ' [FINETUNING]'}"
         )
 
-    def forward(self, x_list, edge_index_list, edge_index_out_list,
-                y_batch=None):
-        """
-        Compute edge predictions for a batch of graphs.
+    def _infer_feature_types(self) -> List[str]:
+        """Infer feature types from feature names."""
+        categorical_features = {'subcalo', 'sampling', 'noise_category'}
+        feature_types = []
+        for fname in self.feature_names:
+            if fname in categorical_features or fname.startswith('subcalo_') or fname.startswith('sampling_'):
+                feature_types.append('categorical')
+            else:
+                feature_types.append('continuous')
+        return feature_types if feature_types else ['continuous']
 
-        Parameters
-        ----------
-        x_list : list[Tensor]
-            Node feature matrices.
-        edge_index_list : list[Tensor]
-            Edge indices used during message passing.
-        edge_index_out_list : list[Tensor]
-            Original graph edges for which predictions are made.
+    def encode(self, x_list, edge_index_list):
         """
-        # Store edge representations from every graph in the batch.
-        all_edge_reprs = []
-
-        # Compute layer weights if they are enabled.
+        Encode node features into embeddings (shared between pretraining and finetuning).
+        
+        Args:
+            x_list: List of node feature tensors
+            edge_index_list: List of edge index tensors
+            
+        Returns:
+            List of node embedding tensors
+        """
         weights = (
             torch.softmax(self.layer_weights, dim=0)
             if self.softmax else self.layer_weights
         ) if self.layer_weights_enabled else None
 
-        # Process each graph independently.
-        for x, proc_edges, orig_edges in zip(
-            x_list, edge_index_list, edge_index_out_list
-        ):
-            # Move graph data to the target device.
+        all_node_embeddings = []
+        
+        for x, proc_edges in zip(x_list, edge_index_list):
             x = x.to(self.device, non_blocking=True)
             proc_edges = proc_edges.to(self.device, non_blocking=True)
 
-            # Compute initial node embeddings.
             x_embed = self.node_embedding(x)
 
-            # Apply successive graph convolution layers with residual
-            # connections.
             for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
                 h = torch.relu(bn(conv(x_embed, proc_edges)))
-
-                # Optionally weight each layer's contribution.
                 if weights is not None:
                     h = weights[i] * h
-
-                # Residual connection helps stabilize deep GNN training.
                 x_embed = x_embed + h
 
-            # Retrieve embeddings for the source and destination nodes of
-            # each original edge.
-            src, dst = orig_edges[0], orig_edges[1]
+            all_node_embeddings.append(x_embed)
+            
+        return all_node_embeddings
 
-            # Form an edge representation by concatenating endpoint
-            # embeddings.
-            all_edge_reprs.append(
-                torch.cat([x_embed[src], x_embed[dst]], dim=-1)
-            )
+    def forward(self, x_list, edge_index_list, edge_index_out_list,
+                y_batch=None, mask=None):
+        """
+        Forward pass supporting both pretraining and finetuning.
+        
+        Args:
+            x_list: Node feature tensors
+            edge_index_list: Edge indices for message passing
+            edge_index_out_list: Original graph edges for prediction
+            y_batch: Labels (for finetuning) or target features (for pretraining)
+            mask: Boolean mask indicating which values were masked
+            
+        Returns:
+            For finetuning: edge predictions
+            For pretraining: (reconstructed features, mask)
+        """
+        # Encode node features
+        node_embeddings = self.encode(x_list, edge_index_list)
+        
+        if self.pretraining:
+            # Reconstruction mode
+            reconstructed = []
+            for emb in node_embeddings:
+                reconstructed.append(self.reconstruction_head(emb))
+            return torch.cat(reconstructed, dim=0)
+        else:
+            # Edge classification mode
+            all_edge_reprs = []
+            for x_embed, orig_edges in zip(node_embeddings, edge_index_out_list):
+                src, dst = orig_edges[0], orig_edges[1]
+                all_edge_reprs.append(
+                    torch.cat([x_embed[src], x_embed[dst]], dim=-1)
+                )
+            return self.fc(torch.cat(all_edge_reprs, dim=0))
 
-        # Predict edge labels for all graphs in the batch.
-        return self.fc(torch.cat(all_edge_reprs, dim=0))
+class FeatureReconstructionHead(nn.Module):
+    """
+    Reconstruction head for masked pretraining.
+    
+    Takes node embeddings and predicts original features for masked nodes.
+    Supports both continuous (MSE loss) and categorical (CrossEntropy loss) features.
+    """
+    
+    def __init__(self, hidden_dim: int, output_dim: int, 
+                 feature_types: List[str] = None):
+        """
+        Args:
+            hidden_dim: Dimension of node embeddings
+            output_dim: Number of features to reconstruct
+            feature_types: List of 'continuous' or 'categorical' for each feature
+        """
+        super().__init__()
+        
+        self.feature_types = feature_types or ['continuous'] * output_dim
+        
+        # Main reconstruction network
+        self.reconstructor = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, output_dim)
+        )
+        
+        # Separate heads for categorical features (if any)
+        self.categorical_heads = nn.ModuleDict()
+        for i, ftype in enumerate(self.feature_types):
+            if ftype == 'categorical':
+                # Assume categories are encoded as integers
+                self.categorical_heads[str(i)] = nn.Linear(hidden_dim, 100)  # Adjust num_classes
+        
+    def forward(self, node_embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Reconstruct features from node embeddings.
+        
+        Args:
+            node_embeddings: Node embeddings from GNN encoder
+            
+        Returns:
+            reconstructed_features: Predicted feature values
+        """
+        return self.reconstructor(node_embeddings)
+
+class MaskedReconstructionLoss(nn.Module):
+    """
+    Combined loss for masked reconstruction.
+    
+    Handles both continuous (MSE) and categorical (CrossEntropy) features.
+    """
+    
+    def __init__(self, feature_types: List[str], 
+                 continuous_loss: str = 'mse',
+                 categorical_weight: float = 1.0):
+        """
+        Args:
+            feature_types: List of 'continuous' or 'categorical' for each feature
+            continuous_loss: 'mse' or 'l1' for continuous features
+            categorical_weight: Weight for categorical features in combined loss
+        """
+        super().__init__()
+        self.feature_types = feature_types
+        self.categorical_weight = categorical_weight
+        
+        if continuous_loss == 'mse':
+            self.continuous_loss_fn = nn.MSELoss(reduction='none')
+        elif continuous_loss == 'l1':
+            self.continuous_loss_fn = nn.L1Loss(reduction='none')
+        else:
+            self.continuous_loss_fn = nn.MSELoss(reduction='none')
+            
+        self.categorical_loss_fn = nn.CrossEntropyLoss(reduction='none')
+    
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor, 
+                mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute reconstruction loss only on masked positions.
+        
+        Args:
+            predictions: Reconstructed features
+            targets: Original features
+            mask: Boolean mask indicating masked positions
+            
+        Returns:
+            Combined reconstruction loss
+        """
+        # Only compute loss on masked positions
+        masked_preds = predictions[mask]
+        masked_targets = targets[mask]
+        
+        if masked_preds.numel() == 0:
+            return torch.tensor(0.0, device=predictions.device)
+        
+        total_loss = 0.0
+        feature_start = 0
+        
+        for i, ftype in enumerate(self.feature_types):
+            if ftype == 'continuous':
+                pred = masked_preds[:, i:i+1] if masked_preds.dim() > 1 else masked_preds
+                target = masked_targets[:, i:i+1] if masked_targets.dim() > 1 else masked_targets
+                total_loss += self.continuous_loss_fn(pred, target).mean()
+            elif ftype == 'categorical':
+                # For categorical features, use CrossEntropy
+                pred = masked_preds[:, i]  # Assuming one-hot or class indices
+                target = masked_targets[:, i].long()
+                total_loss += self.categorical_weight * self.categorical_loss_fn(pred.unsqueeze(0), target.unsqueeze(0)).mean()
+                
+        return total_loss
 
 # ============================================================================
 # DATA GENERATOR
@@ -954,8 +1297,77 @@ class MultiClassBatchGenerator(IterableDataset):
         )
 
 # ============================================================================
-# TRAINING FUNCTIONS
+# TRAINING AND PRE-TRAINING FUNCTIONS
 # ============================================================================
+
+def pretrain_epoch(model, loader, optimizer, criterion, masking_fn, 
+                   scaler, device, feature_names, debug=False):
+    """
+    Pretrain one epoch with masked reconstruction.
+    """
+    model.train()
+    total_loss = 0
+    total_masked = 0
+    
+    optimizer.zero_grad(set_to_none=True)
+    
+    for batch_idx, batch in enumerate(loader):
+        x_list, ei_list, eio_list, _, event_ids, _ = batch
+        
+        # Apply masking to each graph in the batch
+        masked_x_list = []
+        mask_list = []
+        targets_list = []
+        
+        for i, (x, event_id) in enumerate(zip(x_list, event_ids if event_ids else [None]*len(x_list))):
+            if masking_fn:
+                masked_x, mask, targets = masking_fn.apply_mask(
+                    x, 
+                    event_id=event_id.item() if event_id is not None else None,
+                    feature_names=feature_names
+                )
+                masked_x_list.append(masked_x)
+                mask_list.append(mask)
+                targets_list.append(targets)
+            else:
+                masked_x_list.append(x)
+                
+        # Move to device
+        masked_x_list = [x.to(device, non_blocking=True) for x in masked_x_list]
+        ei_list = [e.to(device, non_blocking=True) for e in ei_list]
+        mask_list = [m.to(device, non_blocking=True) for m in mask_list]
+        targets_list = [t.to(device, non_blocking=True) for t in targets_list]
+        
+        # Forward pass
+        predictions = model(masked_x_list, ei_list, eio_list)
+        
+        # Compute reconstruction loss
+        loss = 0
+        for pred, target, mask in zip([predictions], targets_list, mask_list):
+            loss += criterion(pred, target, mask)
+        loss /= len(masked_x_list)
+        
+        # Backward pass with mixed precision
+        if scaler:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+            
+        optimizer.zero_grad(set_to_none=True)
+        
+        total_loss += loss.item()
+        total_masked += sum(m.sum().item() for m in mask_list)
+        
+        if debug and batch_idx >= 2:
+            break
+    
+    avg_loss = total_loss / max(1, len(loader))
+    mask_ratio = total_masked / max(1, sum(m.numel() for m in mask_list))
+    
+    return {'loss': avg_loss, 'mask_ratio': mask_ratio}
 
 def train_epoch(model, loader, optimizer, criterion, scaler,
                 device, debug=False, accumulation_steps=1, epoch=0):
@@ -1736,7 +2148,7 @@ def train_model_full(model, train_loader, test_loader, test_generator, optimizer
 
 
 # ============================================================================
-# SINGLE MODEL TRAINING
+# SINGLE MODEL TRAINING (UPDATED WITH PRETRAINING SUPPORT)
 # ============================================================================
 
 def train_single_model(args, model_type=None, tracker=None):
@@ -1751,21 +2163,24 @@ def train_single_model(args, model_type=None, tracker=None):
     
     features_dict, _, pairs, labels, cluster_info, input_dim, feature_names = load_features_with_selection(args.data_dir, args, tracker)
     
+    # Load cells array for geometry masking
+    cells = None
+    cells_files = sorted(glob.glob(os.path.join(args.data_dir, "cells_*.npy")))
+    if cells_files:
+        cells = np.load(cells_files[0])
+    
     exp_name = args.exp_name or f"{model_name_used}_{'baseline' if not args.all_features else 'all'}_h{args.hidden_dim}_l{args.layers}"
     if model_name_used in ['gat','transformer']: exp_name += f"_heads{args.heads}"
     if args.weighted_loss: exp_name += f"_{args.weight_strategy}"
+    if args.pretrain: exp_name += f"_pretrain_{args.mask_type}_r{args.mask_ratio}"
     model_filename = f"{exp_name}.pt"
     
     log(f"\n{'='*60}\n🔬 EXPERIMENT: {exp_name}\n{'='*60}")
     log(f"   Model: {model_name_used.upper()} | Features: {input_dim} | Hidden: {args.hidden_dim} | Layers: {args.layers}")
+    if args.pretrain:
+        log(f"   Pretraining: {args.mask_type} masking | Ratio: {args.mask_ratio} | Pretrain epochs: {args.pretrain_epochs}")
     
-    criterion = create_loss_function(args, labels, device)
-    model = GraphFoundationModel(input_dim, args.hidden_dim, 5, device, model_name_used, args.layers,
-                                 args.heads, args.dropout, args.layer_weights, args.softmax_weights, args.norm, args.debug).to(device)
-    log(f"   Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-    if tracker: tracker.log_measurement("model_created")
-    
-    # ---- INFERENCE-ONLY MODE (FIX #1: Single forward pass) ----
+    # ---- INFERENCE-ONLY MODE ----
     if args.inference_only:
         log(f"\n{'='*60}\n🔮 INFERENCE-ONLY MODE\n{'='*60}")
         best_model_path = os.path.join(args.save_dir, f"best_{model_filename}")
@@ -1775,7 +2190,23 @@ def train_single_model(args, model_type=None, tracker=None):
             else: log("❌ No checkpoint found."); return None, None
         
         ckpt = torch.load(best_model_path, map_location=device, weights_only=True)
-        model.load_state_dict(ckpt['model_state_dict']); model.eval()
+        
+        # Check if this is a pretrained model (has reconstruction head)
+        is_pretrained = 'reconstruction_head.reconstructor.0.weight' in ckpt.get('model_state_dict', {})
+        
+        # Create model in finetuning mode for inference
+        model = GraphFoundationModel(input_dim, args.hidden_dim, 5, device, model_name_used, args.layers,
+                                     args.heads, args.dropout, args.layer_weights, args.softmax_weights, 
+                                     args.norm, args.debug, pretraining=False, feature_names=feature_names).to(device)
+        
+        # Load only matching parameters
+        model_dict = model.state_dict()
+        pretrained_dict = {k: v for k, v in ckpt['model_state_dict'].items() 
+                          if k in model_dict and 'reconstruction_head' not in k and 'fc' not in k}
+        model_dict.update(pretrained_dict)
+        model.load_state_dict(model_dict)
+        model.eval()
+        
         model_base = os.path.splitext(model_filename)[0]
         parquet_path = os.path.join(args.save_dir, f"results_{model_base}.parquet")
         
@@ -1786,10 +2217,9 @@ def train_single_model(args, model_type=None, tracker=None):
                       'chunk_size': 2000, 'inference_only': True}
         test_generator = MultiClassBatchGenerator(mode='test', **gen_kwargs)
         
-        # FIX #1: Single pass — run_inference computes metrics inline, no separate evaluate() call
         _, test_metrics = run_inference(
             model, test_generator, device,
-            criterion=nn.CrossEntropyLoss(),  # pass criterion for inline metrics
+            criterion=nn.CrossEntropyLoss(),
             num_classes=5,
             debug=args.debug, show_progress=True,
             save_path=parquet_path, model_name=model_base
@@ -1814,7 +2244,164 @@ def train_single_model(args, model_type=None, tracker=None):
         log(f"\n✅ INFERENCE COMPLETE! F1_Sum: {test_metrics['f1_sum_score']:.2f} | Parquet: {parquet_path}")
         return metrics, best_model_path
     
-    # ---- NORMAL TRAINING MODE ----
+    # ---- PRETRAINING MODE ----
+    if args.pretrain:
+        log(f"\n{'='*60}\n🔧 PRETRAINING MODE\n{'='*60}")
+        
+        # Create masking function
+        masking_fn = CalorimeterMasking(
+            mask_ratio=args.mask_ratio,
+            mask_type=args.mask_type,
+            mask_features=args.mask_features,
+            cells_array=cells,
+            cluster_info_dict=cluster_info,
+            geometry_radius=args.geometry_radius
+        )
+        
+        # Create pretraining model
+        pretrain_model = GraphFoundationModel(
+            input_dim, args.hidden_dim, 5, device,
+            model_type=model_name_used,
+            num_layers=args.layers,
+            num_heads=args.heads,
+            dropout=args.dropout,
+            layer_weights=args.layer_weights,
+            softmax_weights=args.softmax_weights,
+            norm_type=args.norm,
+            debug=args.debug,
+            pretraining=True,
+            feature_names=feature_names
+        ).to(device)
+        
+        log(f"   Pretrain params: {sum(p.numel() for p in pretrain_model.parameters() if p.requires_grad):,}")
+        
+        # Create reconstruction loss
+        recon_criterion = MaskedReconstructionLoss(
+            feature_types=pretrain_model._infer_feature_types(),
+            continuous_loss=args.continuous_loss
+        )
+        
+        # Create optimizer and scaler for pretraining
+        pretrain_optimizer = optim.Adam(pretrain_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        pretrain_scaler = torch.amp.GradScaler('cuda') if (args.mixed_precision and args.gpu>=0 and torch.cuda.is_available()) else None
+        log(f"✅ Pretraining: {'FP16' if pretrain_scaler else 'FP32'}")
+        
+        # Create data generators for pretraining (use all data, no labels needed)
+        gen_kwargs = {'features_dict': features_dict, 'neighbor_pairs': pairs, 'labels': labels,
+                      'unscaled_data_dict': None, 'cluster_info_dict': cluster_info,
+                      'debug': args.debug, 'is_bi_directional': True, 
+                      'train_ratio': 1.0,  # Use all data for pretraining
+                      'chunk_size': 2000, 'inference_only': False}
+        pretrain_generator = MultiClassBatchGenerator(mode='train', **gen_kwargs)
+        
+        pretrain_loader = DataLoader(pretrain_generator, batch_size=args.batch_size,
+                                    collate_fn=MultiClassBatchGenerator.collate_data, 
+                                    pin_memory=True, num_workers=0)
+        
+        # Pretraining loop
+        log(f"\n🚀 Starting pretraining for {args.pretrain_epochs} epochs...")
+        best_pretrain_loss = float('inf')
+        pretrain_metrics_history = []
+        
+        for epoch in range(1, args.pretrain_epochs + 1):
+            t0 = time.perf_counter()
+            
+            pretrain_res = pretrain_epoch(
+                pretrain_model, pretrain_loader, pretrain_optimizer, 
+                recon_criterion, masking_fn, pretrain_scaler, device, 
+                feature_names, args.debug
+            )
+            
+            dt = time.perf_counter() - t0
+            pretrain_metrics_history.append({
+                'epoch': epoch,
+                'loss': pretrain_res['loss'],
+                'mask_ratio': pretrain_res['mask_ratio'],
+                'time': dt
+            })
+            
+            # Save best pretrained model
+            if pretrain_res['loss'] < best_pretrain_loss:
+                best_pretrain_loss = pretrain_res['loss']
+                pretrained_path = os.path.join(args.save_dir, f"pretrained_{model_filename}")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': pretrain_model.state_dict(),
+                    'optimizer_state_dict': pretrain_optimizer.state_dict(),
+                    'feature_names': feature_names,
+                    'input_dim': input_dim,
+                    'hidden_dim': args.hidden_dim,
+                    'mask_type': args.mask_type,
+                    'mask_ratio': args.mask_ratio,
+                    'pretrain_loss': pretrain_res['loss'],
+                }, pretrained_path)
+            
+            if epoch == 1 or epoch % max(1, args.pretrain_epochs // 10) == 0 or epoch == args.pretrain_epochs:
+                log(f"[Pretrain Epoch {epoch}/{args.pretrain_epochs}] {dt:.1f}s | Loss: {pretrain_res['loss']:.6f} | Mask ratio: {pretrain_res['mask_ratio']:.3f}")
+            
+            if tracker: 
+                tracker.log_measurement(f"pretrain_epoch_{epoch}", 
+                                       f"Loss={pretrain_res['loss']:.4f}")
+        
+        # Save pretraining metrics
+        pretrain_metrics_path = os.path.join(args.save_dir, f"pretrain_metrics_{exp_name}.pkl")
+        save_pickle(pretrain_metrics_history, pretrain_metrics_path)
+        log(f"💾 Pretraining complete! Best loss: {best_pretrain_loss:.6f}")
+        
+        if not args.finetune_epochs or args.finetune_epochs == 0:
+            log("✅ Pretraining only mode - skipping finetuning")
+            if tracker: 
+                tracker.log_measurement("pretraining_complete")
+                tracker.print_summary()
+                tracker.save_report(f"resource_report_{exp_name}.json")
+            return pretrain_metrics_history, pretrained_path
+        
+        # ---- TRANSFER TO FINETUNING MODEL ----
+        log(f"\n{'='*60}\n🔧 FINETUNING MODE (from pretrained encoder)\n{'='*60}")
+        
+        # Create finetuning model
+        model = GraphFoundationModel(
+            input_dim, args.hidden_dim, 5, device,
+            model_type=model_name_used,
+            num_layers=args.layers,
+            num_heads=args.heads,
+            dropout=args.dropout,
+            layer_weights=args.layer_weights,
+            softmax_weights=args.softmax_weights,
+            norm_type=args.norm,
+            debug=args.debug,
+            pretraining=False,  # Use classification head
+            feature_names=feature_names
+        ).to(device)
+        
+        # Transfer pretrained encoder weights
+        pretrained_dict = pretrain_model.state_dict()
+        finetune_dict = model.state_dict()
+        
+        # Only copy encoder weights (not task-specific heads)
+        transferred_count = 0
+        for k, v in pretrained_dict.items():
+            if k in finetune_dict and 'reconstruction_head' not in k:
+                finetune_dict[k] = v
+                transferred_count += 1
+        
+        model.load_state_dict(finetune_dict)
+        log(f"✅ Transferred {transferred_count} parameters from pretrained encoder")
+        
+        # Use finetuning epochs
+        args.epochs = args.finetune_epochs
+        
+    else:
+        # ---- NORMAL TRAINING MODE (NO PRETRAINING) ----
+        criterion = create_loss_function(args, labels, device)
+        model = GraphFoundationModel(input_dim, args.hidden_dim, 5, device, model_name_used, args.layers,
+                                     args.heads, args.dropout, args.layer_weights, args.softmax_weights, 
+                                     args.norm, args.debug, pretraining=False, feature_names=feature_names).to(device)
+        log(f"   Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+        if tracker: tracker.log_measurement("model_created")
+    
+    # ---- COMMON TRAINING SETUP ----
+    criterion = create_loss_function(args, labels, device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler('cuda') if (args.mixed_precision and args.gpu>=0 and torch.cuda.is_available()) else None
     log(f"✅ {'FP16' if scaler else 'FP32'}")
@@ -1852,6 +2439,14 @@ def main():
     log(f"Model: {args.model.upper()} | Features: {'ALL (42+)' if args.all_features else 'BASELINE (3)'}")
     log(f"Hidden: {args.hidden_dim} | Layers: {args.layers} | GPU: {args.gpu}")
     
+    if args.pretrain:
+        log(f"Mode: PRETRAINING + {'FINETUNING' if args.finetune_epochs > 0 else 'PRETRAINING ONLY'}")
+        log(f"Mask: {args.mask_type} (ratio={args.mask_ratio})")
+    elif args.inference_only:
+        log(f"Mode: INFERENCE ONLY")
+    else:
+        log(f"Mode: SUPERVISED TRAINING")
+    
     tracker = ResourceTracker(log_dir=args.save_dir, enabled=args.track_resources)
     if args.track_resources: tracker.start()
     
@@ -1863,14 +2458,25 @@ def main():
     if args.model == 'all':
         for arch in ['gcn','gat','transformer','sage']:
             log(f"\n{'='*60}\nTraining {arch.upper()}...")
-            try: train_single_model(args, arch, tracker)
-            except Exception as e: log(f"❌ {arch} failed: {e}"); traceback.print_exc()
+            try: 
+                # Create a copy of args with the specific architecture
+                import copy
+                arch_args = copy.deepcopy(args)
+                arch_args.model = arch
+                train_single_model(arch_args, arch, tracker)
+            except Exception as e: 
+                log(f"❌ {arch} failed: {e}"); traceback.print_exc()
             torch.cuda.empty_cache(); gc.collect()
     else:
-        try: train_single_model(args, tracker=tracker)
-        except Exception as e: log(f"❌ Failed: {e}"); traceback.print_exc(); sys.exit(1)
+        try: 
+            train_single_model(args, tracker=tracker)
+        except Exception as e: 
+            log(f"❌ Failed: {e}"); traceback.print_exc(); sys.exit(1)
     
-    if tracker: tracker.print_summary(); tracker.save_report("final_resource_report.json")
+    if tracker: 
+        tracker.print_summary()
+        tracker.save_report("final_resource_report.json")
+    
     log(f"\n{'='*70}\n🎉 PIPELINE COMPLETE!\n{'='*70}")
 
 if __name__ == "__main__":
