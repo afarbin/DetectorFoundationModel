@@ -1,9 +1,8 @@
-
 # CaloGraphNet
 
 > **Graph Neural Networks for Calorimeter Cell Clustering in Particle Physics**
 > 
-> Processes ATLAS ROOT files into graph datasets and trains GNNs (GCN, GAT, Graph Transformer, SAGE) for edge classification.
+> Processes ATLAS ROOT files into graph datasets and trains GNNs (GCN, GAT, Graph Transformer, SAGE) for edge classification with optional masked pretraining.
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
@@ -31,12 +30,18 @@
   - [Evaluation Metrics](#evaluation-metrics)
   - [Output Files](#output-files)
   - [Usage](#usage-train_gnn_modelspy)
+  - [Masked Pretraining (NEW!)](#masked-pretraining-new)
+    - [What is Masked Pretraining?](#what-is-masked-pretraining)
+    - [Masking Strategies](#masking-strategies)
+    - [How Pretraining Works](#how-pretraining-works)
+    - [Pretraining Usage Examples](#pretraining-usage-examples)
 
 ### Analysis & Visualization
 - [File 3: analyze_results.py](#file-3-analyze_resultspy)
   - [What it does](#what-it-does-2)
   - [Visualization Outputs](#visualization-outputs)
   - [Understanding the Metrics](#understanding-the-metrics)
+  - [Pretraining Analysis](#pretraining-analysis-new)
   - [Complete Analysis Workflow](#complete-analysis-workflow)
   - [Interpreting Results Quick Guide](#interpreting-results-quick-guide)
 
@@ -44,6 +49,7 @@
 - [Quick Start](#quick-start)
   - [Installation](#installation)
   - [Complete Example](#complete-example-from-root-to-analysis-report)
+  - [Pretraining Example](#pretraining-example)
   - [Expected Outputs](#expected-outputs)
   - [Analyze Results with Python](#analyze-results-with-python)
 
@@ -76,8 +82,9 @@
 CaloGraphNet is a complete pipeline for graph-based machine learning on calorimeter cell data from particle physics detectors (e.g., ATLAS). It:
 
 1. **Converts ROOT files** → Graph-structured datasets (HDF5 + NumPy)
-2. **Trains Graph Neural Networks** for edge classification
+2. **Trains Graph Neural Networks** for edge classification (with optional masked pretraining)
 3. **Supports multiple architectures**: GCN, GAT, Graph Transformer, GraphSAGE
+4. **Supports self-supervised pretraining**: BERT/MAE-style masked reconstruction
 
 ---
 
@@ -119,11 +126,22 @@ ROOT File (produced from RDO format)
        ↓
 ╔══════════════════════════════════════════════════════════════════╗
 ║              train_gnn_models.py                                 ║
-║  - Loads dataset with feature selection (baseline vs all)        ║
-║  - Builds GNN model (GCN, GAT, Transformer, or SAGE)             ║
-║  - Trains with weighted loss for class imbalance                 ║
-║  - Evaluates with comprehensive metrics (F1 Sum Score, etc.)     ║
-║  - Saves model checkpoints and predictions (Parquet format)      ║
+║                                                                  ║
+║  ┌─────────────────────────────────────────────────────────┐    ║
+║  │  OPTIONAL: Masked Pretraining (--pretrain)              │    ║
+║  │  - Mask random cells/features/clusters/regions          │    ║
+║  │  - Train encoder to reconstruct masked values           │    ║
+║  │  - Learn general calorimeter representations            │    ║
+║  │  - Transfer encoder to downstream task                  │    ║
+║  └─────────────────────────────────────────────────────────┘    ║
+║                          ↓                                       ║
+║  ┌─────────────────────────────────────────────────────────┐    ║
+║  │  Supervised Finetuning (or Training from Scratch)       │    ║
+║  │  - Edge classification with 5 classes                   │    ║
+║  │  - Weighted/focal loss for class imbalance              │    ║
+║  │  - Comprehensive metrics (F1 Sum Score)                 │    ║
+║  └─────────────────────────────────────────────────────────┘    ║
+║                                                                  ║
 ╚══════════════════════════════════════════════════════════════════╝
        ↓
   Trained Model + Predictions + Metrics
@@ -240,7 +258,7 @@ CELL_SIZES = {
 
 This mapping connects `(subCalo, sampling)` pairs to physical cell dimensions in η-φ space. The mapping was derived from the ATLAS detector geometry.
 
-**Geometry features computed per cell** (lines ~300-330):
+**Geometry features computed per cell:**
 - `eta`, `phi`: Cell center coordinates from ROOT branches
 - `deta`, `dphi`: Cell dimensions from CELL_SIZES mapping
 - `volume`: `deta × dphi × 1000 mm` (approximate)
@@ -277,17 +295,18 @@ python build_graph_dataset.py \
 
 ### What it does
 
-This script loads the dataset created by `build_graph_dataset.py`, trains Graph Neural Networks for edge classification, and saves comprehensive results.
+This script loads the dataset created by `build_graph_dataset.py`, trains Graph Neural Networks for edge classification, and saves comprehensive results. It now supports **masked pretraining** followed by supervised finetuning.
 
 **Key operations:**
 1. Loads features with user selection (baseline 3-feature or all 42+ features)
 2. Splits events into train/test sets (default 70/30)
 3. Using custom generator to read the data and construct the batches
-4. Builds a GNN model (GCN, GAT, Graph Transformer, or GraphSAGE)
-5. Sets up loss function (standard, weighted, or focal loss for class imbalance)
-6. Trains with mixed precision (FP16) for faster GPU training
-7. Evaluates using comprehensive metrics including F1 Sum Score (class imbalance-aware)
-8. Saves best model checkpoint and prediction results (Parquet format)
+4. Optionally runs **masked pretraining** to learn general representations
+5. Builds a GNN model (GCN, GAT, Graph Transformer, or GraphSAGE)
+6. Sets up loss function (standard, weighted, or focal loss for class imbalance)
+7. Trains with mixed precision (FP16) for faster GPU training
+8. Evaluates using comprehensive metrics including F1 Sum Score (class imbalance-aware)
+9. Saves best model checkpoint and prediction results (Parquet format)
 
 ### Feature Sets
 
@@ -314,12 +333,12 @@ This script loads the dataset created by `build_graph_dataset.py`, trains Graph 
 
 ### Model Architectures
 
-All models follow the same unified design:
+All models follow the same unified design with a shared encoder:
 
 ```
 Input: Node features (N_cells × F)
        ↓
-Node Embedding (Linear: F → hidden_dim) (1 dense layer FIX THIS DESCRIPTION)
+Node Embedding (Linear: F → hidden_dim)
        ↓
 L GNN Layers (configurable)
   ├── Message passing (GCNConv / GATConv / TransformerConv / SAGEConv)
@@ -327,11 +346,18 @@ L GNN Layers (configurable)
   ├── ReLU activation
   └── Residual connection
        ↓
-Edge Representation: Concatenate [h_src, h_dst] for each edge
-       ↓
-Classifier (Linear: 2*hidden_dim → 5)
-       ↓
-Output: Logits for 5 classes
+┌──────────────────────────────────────────────────────┐
+│  Two heads, depending on mode:                       │
+│                                                      │
+│  Pretraining:                                        │
+│    Reconstruction Head → Reconstructed Features      │
+│    Loss: MSE/L1 on masked positions only             │
+│                                                      │
+│  Finetuning:                                         │
+│    Edge Representation: [h_src || h_dst]             │
+│    Classifier (Linear: 2*hidden_dim → 5)             │
+│    Loss: CrossEntropy / Focal                        │
+└──────────────────────────────────────────────────────┘
 ```
 
 | Model | `--model` | Key Parameter | Best For |
@@ -361,6 +387,11 @@ FL(p_t) = -α_t × (1 - p_t)^γ × log(p_t)
 #### Standard CrossEntropy
 - No class weighting (default)
 
+#### Masked Reconstruction Loss (for pretraining)
+- **MSE** or **L1** for continuous features (SNR, η, φ, energy, etc.)
+- **CrossEntropy** for categorical features (subcalo, sampling, noise_category)
+- Computed **only on masked positions** to prevent trivial copying
+
 ### Evaluation Metrics
 
 The script computes comprehensive metrics. **Best model selection uses F1 Sum Score** (accounts for both false positives and false negatives).
@@ -381,6 +412,7 @@ Training produces these files in `--save-dir` (default: `/storage/mxg1065/founda
 
 #### 1. Model Checkpoints
 - `best_{exp_name}.pt` - Best model based on F1 Sum Score
+- `pretrained_{exp_name}.pt` - Best pretrained encoder (if `--pretrain` used)
 - `{exp_name}_epoch{N}.pt` - Checkpoint at each epoch (for resuming)
 
 #### 2. Metrics File
@@ -389,6 +421,7 @@ Training produces these files in `--save-dir` (default: `/storage/mxg1065/founda
   - Test metrics per epoch
   - Best epoch and best metrics
   - Model arguments (for reproducibility)
+- `pretrain_metrics_{exp_name}.pkl` - Pretraining loss history (if `--pretrain` used)
 
 #### 3. Predictions (Parquet format)
 - `results_{exp_name}.parquet` - Per-edge predictions with schema:
@@ -402,17 +435,15 @@ Training produces these files in `--save-dir` (default: `/storage/mxg1065/founda
 | `true_label` | int8 | Ground truth (0-4) |
 | `pred_label` | int8 | Model prediction (0-4) |
 | `confidence` | float32 | Softmax probability of predicted class |
-| `score_class_0` | float32 | Raw logit / probability for class 0 |
-| `score_class_1` | float32 | Raw logit / probability for class 1 |
-| `score_class_2` | float32 | Raw logit / probability for class 2 |
-| `score_class_3` | float32 | Raw logit / probability for class 3 |
-| `score_class_4` | float32 | Raw logit / probability for class 4 |
+| `score_class_0` | float32 | Score for class 0 |
+| `score_class_1` | float32 | Score for class 1 |
+| `score_class_2` | float32 | Score for class 2 |
+| `score_class_3` | float32 | Score for class 3 |
+| `score_class_4` | float32 | Score for class 4 |
 | `model_name` | string | Model identifier |
 | `source_cluster` | int32 | Cluster ID of source cell (if available) |
 | `target_cluster` | int32 | Cluster ID of target cell (if available) |
 | `same_cluster` | bool | Whether cells share same cluster (if available) |
-
-**Parquet advantages:** Columnar format, fast to query, efficient compression (ZSTD), works with Pandas/Dask/Spark.
 
 ### Usage: train_gnn_models.py
 
@@ -465,18 +496,204 @@ python train_gnn_models.py \
 | `--heads` | 2 | Attention heads (GAT/Transformer) |
 | `--dropout` | 0.0 | Dropout rate |
 | `--norm` | `batch` | Normalization: `batch`, `layer`, `none` |
-| `--epochs`, `-e` | 30 | Training epochs |
+| `--epochs`, `-e` | 30 | Training/finetuning epochs |
 | `--batch-size`, `-b` | 1 | Batch size (events per batch) |
 | `--lr` | 1e-3 | Learning rate |
 | `--weighted-loss` | False | Use weighted loss for imbalance |
 | `--weight-strategy` | `inverse` | `inverse`, `focal`, `logarithmic` |
 | `--focal-gamma` | 2.0 | Focal loss focusing parameter |
-| `--focal-alpha` | 0.25 | Alpha parameter for focal loss |
 | `--gpu`, `-g` | 0 | GPU ID (-1 for CPU) |
-| `--mixed-precision` | True | Enable FP16 training (faster on GPU) |
+| `--mixed-precision` | True | Enable FP16 training |
 | `--inference-only` | False | Skip training, only run inference |
 | `--resume` | True | Resume from checkpoint if exists |
 | `--patience` | 10 | Early stopping patience |
+
+---
+
+### Masked Pretraining (NEW!)
+
+#### What is Masked Pretraining?
+
+Masked pretraining is a self-supervised learning technique inspired by BERT and Masked Autoencoders (MAE). Instead of training directly on labeled edge classification, the model first learns general representations of calorimeter data by:
+
+1. **Masking** (hiding) parts of the input
+2. **Reconstructing** the hidden parts from neighboring context
+3. **Transferring** the learned encoder to downstream tasks
+
+This allows the model to learn meaningful patterns in calorimeter cell data **without using any edge labels**. The encoder learns that nearby cells have correlated energies, that SNR varies systematically across the detector, and that cluster structure imposes constraints on cell features.
+
+#### Masking Strategies
+
+The script supports four masking strategies, each designed to teach the model different aspects of calorimeter physics:
+
+| Strategy | `--mask-type` | What Gets Masked | Physics Motivation |
+|----------|---------------|------------------|-------------------|
+| **Random Cell** | `random` | ~15% of cells (all features) | Learn from neighboring cells (like BERT) |
+| **Feature** | `feature` | Specific features (e.g., SNR) across cells | Learn relationships between features |
+| **Geometry** | `geometry` | Cells in a contiguous spatial region | Force long-range spatial reasoning |
+| **Cluster** | `cluster` | All cells in selected topo-clusters | Learn cluster-level structure |
+
+**Detailed explanation of each strategy:**
+
+##### 1. Random Cell Masking (`--mask-type random`)
+- Randomly selects `--mask-ratio` fraction of cells
+- Replaces ALL features of selected cells with zeros (or a learnable mask token)
+- Model must reconstruct SNR, η, φ from neighboring cells
+- **Best starting point** - simplest to implement and validate
+- **Physics analogy**: Like inferring a cell's energy from its neighbors
+
+##### 2. Feature Masking (`--mask-type feature`)
+- Masks specific features (e.g., only SNR) across a subset of cells
+- Use `--mask-features snr eta phi` to specify which features
+- Model learns cross-feature relationships
+- **Use when:** You want to learn which features are redundant/predictable
+- **Physics analogy**: Like predicting SNR from η, φ, and neighbor information
+
+##### 3. Geometry Masking (`--mask-type geometry`)
+- Selects a random seed cell, masks nearby cells in η-φ space
+- Window size controlled by `--geometry-radius`
+- Forces model to use distant cells for reconstruction
+- **Use when:** You want to improve long-range edge prediction
+- **Physics analogy**: Like reconstructing a localized energy deposit from surrounding detector regions
+
+##### 4. Cluster Masking (`--mask-type cluster`)
+- Masks all cells belonging to selected topo-clusters
+- Requires `cell_cluster_index` in event data (from `events.h5`)
+- Model must reconstruct entire cluster properties from outside the cluster
+- **Use when:** You want pretraining aligned with the clustering objective
+- **Physics motivation:** Most similar to actual reconstruction task - identifying clusters from surrounding noise
+
+#### How Pretraining Works
+
+**Architecture during pretraining:**
+```
+Input: Node features (with some masked to 0)
+       ↓
+Graph Encoder (GCN/GAT/Transformer/SAGE)
+  - Message passing over unmasked + masked cells
+  - Masked cells still receive messages from neighbors
+       ↓
+Reconstruction Head (MLP: hidden → hidden/2 → input_dim)
+       ↓
+Output: Reconstructed features (all cells)
+       ↓
+Loss: Computed ONLY on masked positions
+  - Continuous features: MSE or L1 loss
+  - Categorical features: CrossEntropy loss
+```
+
+**After pretraining, the workflow is:**
+
+```
+Step 1: Pretrain encoder on masked reconstruction
+        (no edge labels needed for this step!)
+        → Saves: pretrained_{exp_name}.pt
+        
+Step 2: Transfer encoder weights to classification model
+        (reconstruction head is discarded)
+        (classification head is randomly initialized)
+        
+Step 3: Finetune on labeled edge classification data
+        (use --finetune-epochs instead of --epochs)
+        → Saves: best_{exp_name}.pt
+```
+
+**Key implementation details:**
+
+- **Loss computed only on masked positions**: Prevents model from simply copying input. Forces learning from neighborhood context.
+- **Feature type detection**: Automatically identifies continuous vs categorical features
+  - Continuous (SNR, η, φ, energy): MSE/L1 loss
+  - Categorical (subcalo, sampling, noise_category): CrossEntropy loss
+- **Encoder transfer**: Only GNN layer weights and embedding are transferred
+  - Reconstruction head is discarded after pretraining
+  - Classification head (edge classifier) is randomly initialized
+- **Pretraining uses all data** (train_ratio=1.0) since no labels are needed
+
+#### Pretraining Usage Examples
+
+```bash
+# Basic pretraining: random cell masking, then finetune
+python train_gnn_models.py \
+    --model gcn \
+    --baseline \
+    --pretrain \
+    --mask-type random \
+    --mask-ratio 0.15 \
+    --pretrain-epochs 100 \
+    --finetune-epochs 30 \
+    --gpu 0
+
+# Feature masking: learn cross-feature relationships
+python train_gnn_models.py \
+    --model transformer \
+    --all-features \
+    --pretrain \
+    --mask-type feature \
+    --mask-features snr energy_raw noise_raw \
+    --mask-ratio 0.20 \
+    --pretrain-epochs 150 \
+    --finetune-epochs 50 \
+    --gpu 1
+
+# Cluster masking: pretrain on cluster structure
+python train_gnn_models.py \
+    --model sage \
+    --baseline \
+    --pretrain \
+    --mask-type cluster \
+    --mask-ratio 0.30 \
+    --pretrain-epochs 200 \
+    --finetune-epochs 30 \
+    --gpu 0
+
+# Geometry masking with all features
+python train_gnn_models.py \
+    --model gat \
+    --all-features \
+    --pretrain \
+    --mask-type geometry \
+    --geometry-radius 3 \
+    --mask-ratio 0.15 \
+    --pretrain-epochs 200 \
+    --finetune-epochs 30 \
+    --gpu 1
+
+# Pretrain only (no finetuning) - save encoder for later use
+python train_gnn_models.py \
+    --model gcn \
+    --baseline \
+    --pretrain \
+    --mask-type random \
+    --mask-ratio 0.15 \
+    --pretrain-epochs 500 \
+    --finetune-epochs 0 \
+    --gpu 0
+
+# Compare all masking strategies with same architecture
+for mask_type in random feature geometry cluster; do
+    python train_gnn_models.py \
+        --model gcn --baseline --pretrain \
+        --mask-type $mask_type \
+        --pretrain-epochs 100 --finetune-epochs 30 \
+        --exp-name "pretrain_${mask_type}" \
+        --gpu 0
+done
+```
+
+**Monitoring pretraining progress:**
+- Reconstruction loss should decrease steadily over epochs
+- Mask ratio stays constant (logged for verification)
+- Best pretrained model saved based on lowest reconstruction loss
+- Log messages show: `[Pretrain Epoch X/Y] Loss: Z.ZZZZZZ | Mask ratio: 0.XXX`
+
+**Pretraining output files:**
+
+| File | Description |
+|------|-------------|
+| `pretrained_{exp_name}.pt` | Best pretrained encoder (before finetuning) |
+| `pretrain_metrics_{exp_name}.pkl` | Pretraining loss history per epoch |
+| `{exp_name}_metrics.pkl` | Finetuning metrics (standard format) |
+| `best_{exp_name}.pt` | Best finetuned model |
 
 ---
 
@@ -484,7 +701,7 @@ python train_gnn_models.py \
 
 ### What it does
 
-Generates comprehensive analysis and visualization for trained models. This script takes the model checkpoint files (`.pkl`) and prediction files (`.parquet`) from `train_gnn_models.py` and produces publication-ready figures and reports.
+Generates comprehensive analysis and visualization for trained models. This script takes the model checkpoint files (`.pkl`) and prediction files (`.parquet`) from `train_gnn_models.py` and produces publication-ready figures and reports. It now supports analysis of pretrained models.
 
 **Visualization outputs:**
 
@@ -495,12 +712,14 @@ Generates comprehensive analysis and visualization for trained models. This scri
 | **Confusion Matrix** | Normalized confusion matrix | Per-class misclassification patterns |
 | **Per-Class Bar Chart** | Recall, Precision, F1 per class | Compare performance across 5 classes |
 | **Radar Chart** | Multi-metric comparison | Top models compared across 5 metrics |
-| **FSS vs RSS Scatter** | F1 Sum vs Recall Sum | Identify models with good precision (FSS > RSS) |
+| **FSS vs RSS Scatter** | F1 Sum vs Recall Sum | Identify models with good precision |
 | **Architecture Box Plot** | Performance by architecture | Compare GCN vs GAT vs Transformer vs SAGE |
+| **Pretraining Curves** 🆕 | Reconstruction loss + mask ratio | Monitor pretraining convergence |
+| **Pretrain vs Scratch** 🆕 | Box plot comparison | Impact of pretraining on FSS |
 
 **Report outputs:**
 
-- **`master_report.html`** - Interactive HTML report with all results
+- **`master_report.html`** - Interactive HTML report with all results (including pretraining)
 - **`comprehensive_metrics.csv`** - All metrics in CSV format
 - **`comprehensive_table.html`** - Styled table of top 10 models
 
@@ -510,9 +729,9 @@ Generates comprehensive analysis and visualization for trained models. This scri
 - **Primary metric**: F1 Sum Score (FSS) = Σ(F1 per class) - balances precision AND recall
   - Perfect score = 5.0
   - Random baseline = 1.0
-  - Accounts for False Positives (unlike RSS)
 - **Model ranking**: Automatically ranks models and identifies best performer by FSS
 - **Architecture comparison**: Compares GCN vs GAT vs Transformer vs SAGE
+- **Pretraining support** 🆕: Detects pretrained models, shows pretraining curves, compares vs scratch
 - **Fallback handling**: If FSS not found, uses RSS with warning
 
 ### Output Directory Structure
@@ -529,9 +748,15 @@ analysis_output/
 │   ├── confusion_matrices/      # Confusion matrices + per-class bars
 │   │   └── {model_name}_confusion_enhanced.png
 │   ├── comparison_plots/        # Cross-model comparisons
-│   │   └── comprehensive_metrics.png
-│   └── metrics_radar/           # Radar charts of top models
-│       └── metrics_radar.png
+│   │   ├── comprehensive_metrics.png
+│   │   └── pretrain_vs_scratch.png      🆕
+│   ├── metrics_radar/           # Radar charts of top models
+│   │   └── metrics_radar.png
+│   ├── loss_curves/             # Training/validation loss curves
+│   │   ├── {model_name}_loss_curves.png
+│   │   └── loss_comparison.png
+│   └── pretrain_metrics/        🆕 Pretraining analysis
+│       └── pretraining_curves.png
 ├── tables/
 │   └── comprehensive_table.html  # Styled performance table
 ├── reports/
@@ -555,7 +780,6 @@ analysis_output/
   - High Accuracy (~90%) ❌ misleading
   - High RSS (~4.5) ❌ misses the problem
   - Low FSS (~1.2) ✅ reveals the issue
-- FSS penalizes models that sacrifice precision for recall
 
 ### Usage
 
@@ -567,6 +791,15 @@ python analyze_results.py \
     --output-dir ./analysis_output
 ```
 
+**With pretraining analysis:**
+```bash
+python analyze_results.py \
+    --models-dir /storage/foundation_experiments \
+    --parquet-dir /storage/foundation_experiments \
+    --output-dir ./analysis_output \
+    --include-pretrain-metrics
+```
+
 **Advanced usage with custom limits:**
 ```bash
 python analyze_results.py \
@@ -576,7 +809,8 @@ python analyze_results.py \
     --max-rows-roc 1000000 \
     --max-rows-confusion 2000000 \
     --top-n 10 \
-    --batch-size 50000
+    --batch-size 50000 \
+    --include-pretrain-metrics
 ```
 
 **Key arguments:**
@@ -586,10 +820,39 @@ python analyze_results.py \
 | `--models-dir` | Required | Directory containing `*_metrics.pkl` files |
 | `--parquet-dir` | Required | Directory containing `results_*.parquet` files |
 | `--output-dir` | `./analysis_output` | Output directory for all results |
-| `--max-rows-roc` | 500000 | Max rows for ROC/PR computation (memory control) |
+| `--max-rows-roc` | 500000 | Max rows for ROC/PR computation |
 | `--max-rows-confusion` | 1000000 | Max rows for confusion matrix |
-| `--top-n` | 5 | Number of top models to show in radar chart |
+| `--top-n` | 5 | Number of top models in radar chart |
 | `--batch-size` | 100000 | Batch size for parquet reading |
+| `--include-pretrain-metrics` 🆕 | False | Include pretraining analysis |
+
+### Pretraining Analysis (NEW!)
+
+When models are trained with `--pretrain`, the analysis script can generate additional plots:
+
+**Pretraining Loss Curves:**
+- Shows reconstruction loss decreasing over pretraining epochs
+- Log scale for better visibility of convergence
+- Mask ratio is also plotted (should remain constant)
+
+**Pretrain vs Scratch Comparison:**
+- Box plot comparing F1 Sum Score of pretrained vs scratch models
+- Per-class F1 comparison between best pretrained and best scratch model
+- Useful for quantifying the benefit of pretraining
+
+**HTML Report Updates:**
+- Pretrained models are flagged with 🔧 badge
+- Pretraining strategy summary (mask types, ratios used)
+- Dedicated pretraining analysis section
+
+**Usage:**
+```bash
+python analyze_results.py \
+    --models-dir /storage/foundation_experiments \
+    --parquet-dir /storage/foundation_experiments \
+    --output-dir ./analysis_output \
+    --include-pretrain-metrics
+```
 
 ### What Each Plot Tells You
 
@@ -599,77 +862,52 @@ python analyze_results.py \
   - Diagonal line = random guessing (AUC=0.5)
 - **Right panel**: F1 vs Recall scatter plot
   - Bubble size = Precision (larger = better precision)
-  - Points above the diagonal = good precision-recall balance
 
 #### 2. Precision-Recall Curves
 - **Each class subplot**: PR curve with F1 iso-lines
   - Dashed lines = constant F1 values (0.2, 0.4, 0.6, 0.8)
   - Dot = point with best F1 score
-  - AP = Average Precision (area under PR curve)
 - **Summary plot**: All classes together for comparison
-- **Interpretation**: For imbalanced data, PR curves are more informative than ROC
 
 #### 3. Confusion Matrix + Per-Class Bars
-- **Left**: Normalized confusion matrix
-  - Diagonal = correct classifications (higher = better)
-  - Off-diagonal = common confusions
+- **Left**: Normalized confusion matrix (diagonal = correct)
 - **Right**: Per-class Recall, Precision, F1 bar chart
-  - Classes 0 and 4 are typically hardest (noise vs different clusters)
-  - Classes 2 and 3 should be symmetric (source-only vs dest-only)
 
 #### 4. Comprehensive Comparison Plots
 - **Top-left**: FSS vs RSS bar chart
-  - If FSS < RSS significantly → model has poor precision
-  - Green bars (FSS) vs Blue bars (RSS)
 - **Top-right**: FSS vs RSS scatter
-  - Red points = FSS < RSS (precision problem)
-  - Blue points = FSS ≈ RSS (good balance)
 - **Bottom-left**: Per-class F1 scores (top 7 models)
-  - Shows which classes each model handles well
 - **Bottom-right**: Architecture comparison box plot
-  - Compares GCN, GAT, Transformer, SAGE performance
 
 #### 5. Radar Chart
 - Shows top N models across 5 metrics
 - Larger area = better overall performance
-- Different shapes reveal model strengths/weaknesses
 
-### Understanding the HTML Report
+#### 6. Pretraining Curves 🆕
+- **Left**: Reconstruction loss per epoch (log scale)
+- **Right**: Mask ratio during pretraining
 
-The `master_report.html` provides:
-
-1. **Summary statistics** - Best model's FSS, Macro F1, Accuracy
-2. **Metric explanation** - Why FSS is primary
-3. **Interactive table** - Sortable, searchable model rankings
-4. **Embedded images** - All comparison plots
-5. **Class definitions** - What each label means
-
-Open it in any browser:
-```bash
-open analysis_output/reports/master_report.html  # macOS
-xdg-open analysis_output/reports/master_report.html  # Linux
-start analysis_output/reports/master_report.html  # Windows
-```
+#### 7. Pretrain vs Scratch 🆕
+- **Left**: Box plot comparing FSS distributions
+- **Right**: Per-class F1 of best pretrained vs best scratch
 
 ### Complete Analysis Workflow
 
-Here's the full pipeline from training to analysis:
-
 ```bash
-# Step 1: Train multiple models (optional: use --model all)
+# Step 1: Train models
 python train_gnn_models.py --model gcn --baseline --gpu 0
 python train_gnn_models.py --model gat --baseline --gpu 0
-python train_gnn_models.py --model transformer --all-features --gpu 0
+python train_gnn_models.py --model gcn --baseline --pretrain --mask-type cluster --gpu 0
 
-# Step 2: Run inference on best checkpoints (if not done during training)
+# Step 2: Run inference on best checkpoints
 python train_gnn_models.py --model gcn --baseline --inference-only
-python train_gnn_models.py --model gat --baseline --inference-only
 
-# Step 3: Analyze all results
+# Step 3: Analyze all results (including pretraining)
 python analyze_results.py \
     --models-dir /storage/foundation_experiments \
     --parquet-dir /storage/foundation_experiments \
-    --output-dir ./final_analysis
+    --output-dir ./final_analysis \
+    --include-pretrain-metrics
 
 # Step 4: Open report
 open ./final_analysis/reports/master_report.html
@@ -680,34 +918,31 @@ open ./final_analysis/reports/master_report.html
 | If you see... | This means... | Action |
 |---------------|----------------|--------|
 | FSS > 4.0 | Excellent model | Deploy or use for physics analysis |
-| FSS < 2.5 | Poor performance | Try more features or different architecture |
+| FSS < 2.5 | Poor performance | Try pretraining or different architecture |
 | FSS much lower than RSS | Precision problem | Use focal loss or class weights |
-| Class 0 F1 < 0.5 | Noise identification issues | Check noise statistics in data creation |
-| Class 4 F1 < 0.3 | Cluster separation failing | Add cluster-based features |
-| High accuracy but low FSS | Class imbalance masking issues | Trust FSS, not accuracy |
-| Transformer > GCN by >0.5 | Long-range dependencies matter | Use transformer with attention |
-| GAT > GCN by >0.3 | Graph structure is non-uniform | Attention helps - keep GAT |
+| Pretrained FSS > Scratch FSS 🆕 | Pretraining helps | Increase pretrain epochs or try cluster masking |
+| Pretrain loss plateaus early 🆕 | Model capacity saturated | Increase hidden_dim or layers |
+| Class 0 F1 < 0.5 | Noise identification issues | Check noise statistics |
+| Class 4 F1 < 0.3 | Cluster separation failing | Try cluster masking pretraining |
 
 ### Troubleshooting
 
 **"No parquet files found"**
 - Ensure you ran inference with `--inference-only` or training completed fully
-- Check that `--parquet-dir` points to directory with `results_*.parquet` files
 
 **"Memory error"**
 - Reduce `--max-rows-roc` and `--max-rows-confusion`
 - Reduce `--batch-size`
-- Use fewer models in the directory
 
 **"Missing metrics in pickle"**
 - The script falls back to RSS if FSS not found
-- Check that you're using the latest `train_gnn_models.py`
 
-**"Different number of models in PKL vs Parquet"**
-- Some models may have completed training but not inference
-- Run `--inference-only` for those models
+**"Pretraining metrics not found"** 🆕
+- Use `--include-pretrain-metrics` flag
+- Ensure `pretrain_metrics_*.pkl` files exist in models directory
 
 ---
+
 ## Quick Start
 
 ### Installation
@@ -740,7 +975,7 @@ python build_graph_dataset.py \
 # - events_physics_run.h5 (features)
 # - labels_physics_run.npy (ground truth)
 
-# Step 2: Train models (optional: use --model all for multiple architectures)
+# Step 2: Train models
 python train_gnn_models.py \
     --model gcn \
     --baseline \
@@ -766,36 +1001,79 @@ python analyze_results.py \
 open ./analysis_results/reports/master_report.html
 ```
 
+### Pretraining Example
+
+```bash
+# Step 1: Build dataset (same as above)
+python build_graph_dataset.py \
+    --input /data/run12345.root \
+    --output-dir /my_data \
+    --dataset-name physics_run
+
+# Step 2: Pretrain with cluster masking, then finetune
+python train_gnn_models.py \
+    --model gcn \
+    --baseline \
+    --data-dir /my_data/physics_run \
+    --pretrain \
+    --mask-type cluster \
+    --mask-ratio 0.25 \
+    --pretrain-epochs 200 \
+    --finetune-epochs 30 \
+    --gpu 0
+
+# Step 3: Also train a baseline without pretraining for comparison
+python train_gnn_models.py \
+    --model gcn \
+    --baseline \
+    --data-dir /my_data/physics_run \
+    --epochs 30 \
+    --gpu 0
+
+# Step 4: Analyze with pretraining metrics
+python analyze_results.py \
+    --models-dir /storage/foundation_experiments \
+    --parquet-dir /storage/foundation_experiments \
+    --output-dir ./pretrain_analysis \
+    --include-pretrain-metrics
+
+# Step 5: Open report to compare pretrained vs scratch
+open ./pretrain_analysis/reports/master_report.html
+```
+
 ### Expected Outputs
 
 After running the full pipeline, you'll have:
 
 ```
 /storage/foundation_experiments/
-├── best_gcn_baseline_h128_l6.pt          # Best model checkpoint
-├── gcn_baseline_h128_l6_metrics.pkl      # Training metrics
-├── results_gcn_baseline_h128_l6.parquet  # Predictions (230M edges)
+├── best_gcn_baseline_h128_l6.pt              # Best model checkpoint
+├── pretrained_gcn_baseline_h128_l6.pt        # Best pretrained encoder (if pretrained)
+├── gcn_baseline_h128_l6_metrics.pkl          # Training metrics
+├── pretrain_metrics_gcn_baseline_h128_l6.pkl # Pretraining metrics (if pretrained)
+├── results_gcn_baseline_h128_l6.parquet      # Predictions
 
 ./analysis_results/
-├── figures/                               # All plots
-│   ├── roc_curves/                       # ROC per model
-│   ├── pr_curves/                        # PR per model
-│   ├── confusion_matrices/               # Confusion matrices
-│   ├── comparison_plots/                 # Cross-model comparisons
-│   └── metrics_radar/                    # Radar charts
+├── figures/                                   # All plots
+│   ├── roc_curves/                           # ROC per model
+│   ├── pr_curves/                            # PR per model
+│   ├── confusion_matrices/                   # Confusion matrices
+│   ├── comparison_plots/                     # Cross-model comparisons
+│   ├── metrics_radar/                        # Radar charts
+│   ├── loss_curves/                          # Loss curves
+│   └── pretrain_metrics/                     # Pretraining analysis 🆕
 ├── tables/
-│   └── comprehensive_table.html          # Sortable results table
+│   └── comprehensive_table.html              # Sortable results table
 ├── reports/
-│   └── master_report.html                # Complete analysis report
+│   └── master_report.html                    # Complete analysis report
 └── data/
-    └── comprehensive_metrics.csv         # All metrics in CSV
+    └── comprehensive_metrics.csv             # All metrics in CSV
 ```
 
 ### Analyze Results with Python
 
 ```python
 import pandas as pd
-import matplotlib.pyplot as plt
 
 # Load predictions
 df = pd.read_parquet("results_gcn_baseline_h128_l6.parquet")
@@ -823,6 +1101,7 @@ print(f"Best model: {metrics_df.iloc[0]['name']} (FSS={metrics_df.iloc[0]['f1_su
 ```
 
 ---
+
 ## Configuration Reference
 
 ### build_graph_dataset.py Full Arguments
@@ -888,7 +1167,7 @@ Feature Selection:
   --all-features        Use all 42+ features
 
 Training:
-  --epochs, -e EPOCHS   Number of epochs (default: 30)
+  --epochs, -e EPOCHS   Number of finetuning epochs (default: 30)
   --batch-size, -b BATCH_SIZE
                         Batch size in events (default: 1)
   --lr LR               Learning rate (default: 1e-3)
@@ -900,29 +1179,44 @@ Loss Functions:
                         Class weighting strategy (default: inverse)
   --focal-gamma GAMMA   Focal loss gamma (default: 2.0)
 
+Pretraining (NEW):
+  --pretrain            Enable masked pretraining before finetuning
+  --mask-type {random,feature,geometry,cluster}
+                        Masking strategy (default: random)
+  --mask-ratio RATIO    Fraction of cells/features to mask (default: 0.15)
+  --mask-features FEAT [FEAT ...]
+                        Specific features to mask (for feature masking)
+  --geometry-radius R   Radius for geometry masking window (default: 2)
+  --pretrain-epochs N   Number of pretraining epochs (default: 100)
+  --finetune-epochs N   Number of finetuning epochs after pretraining (default: 30)
+  --continuous-loss {mse,l1}
+                        Loss for continuous features in pretraining (default: mse)
+
 Hardware:
   --gpu, -g GPU         GPU ID (-1 for CPU) (default: 0)
   --mixed-precision     Enable mixed precision (default: True)
   --no-mixed-precision  Disable mixed precision
 
 Experiment:
-  --save-dir SAVE_DIR   Directory to save models (default: /storage/...)
+  --save-dir SAVE_DIR   Directory to save models
   --exp-name EXP_NAME   Experiment name (auto-generated if not provided)
-  --data-dir DATA_DIR   Data directory (default: /storage/mxg1065/datafiles)
+  --data-dir DATA_DIR   Data directory
   --inference-only      Skip training, only run inference
   --resume              Resume from checkpoint (default: True)
   --debug               Debug mode (only runs a few events)
 ```
 
+---
+
 ## Current Limitations & Lessons Learned
 
 ### The Challenge: Why Performance Isn't Where We Want It
 
-Despite experimenting with multiple architectures (GCN, GAT, Graph Transformer, GraphSAGE), feature sets, and loss functions, the best model achieves an **F1 Sum Score of only 2.75** (where 5.0 would be perfect). This section documents what we've learned from our experiments and where we believe the fundamental issues lie.
+Despite experimenting with multiple architectures, feature sets, loss functions, and now **masked pretraining**, the best supervised model achieves an **F1 Sum Score of ~2.75** (where 5.0 would be perfect). This section documents what we've learned and where we believe the fundamental issues lie.
 
 ### Our Best Results So Far
 
-From 11 trained models, here are the top performers:
+From trained models, here are the top performers:
 
 | Rank | Model | F1 Sum Score | Accuracy | Macro F1 | Key Features |
 |------|-------|--------------|----------|----------|--------------|
@@ -932,216 +1226,87 @@ From 11 trained models, here are the top performers:
 | 4 | SAGE (inverse loss) | 2.25 | 84.9% | 0.45 | Baseline |
 | 5 | Transformer (inverse loss) | 2.25 | 85.3% | 0.45 | Baseline |
 
-**Key observation:** The best models achieve **~95% accuracy** but only **~2.75 FSS** (55% of perfect). This massive gap between accuracy and FSS tells us something important.
+**Note:** Pretraining results are under active investigation and will be added as they become available.
 
 ### Lesson 1: Accuracy is Dangerously Misleading for Imbalanced Data
 
-**The problem:** In our dataset, Class 0 (Lone-Lone / noise-noise) dominates with ~92% of all edges. A trivial model that predicts **every edge as Class 0** achieves:
-- **Accuracy: 92%** (looks excellent! ✅)
-- **F1 Sum Score: ~1.2** (close to random baseline of 1.0 ❌)
-- **Macro F1: ~0.20** (fails on all other classes ❌)
-
-**Our actual best model vs trivial baseline:**
-
-| Metric | Trivial Model (all Class 0) | Our Best Model (SAGE + focal) | Improvement |
-|--------|----------------------------|-------------------------------|-------------|
-| Accuracy | 92.0% | 95.1% | +3.1% |
-| F1 Sum Score | ~1.2 | **2.75** | +129% |
-| Macro F1 | ~0.20 | **0.55** | +175% |
-
-**Our solution:** We abandoned accuracy entirely as a meaningful metric and adopted:
-- **F1 Sum Score (FSS)** = Σ(F1 per class) - **Accounts for BOTH False Positives AND False Negatives**
-- Perfect score = 5.0 (all classes perfect)
-- Random baseline = 1.0 (all classes at chance)
-
-**Why FSS is superior:** The trivial "all Class 0" model scores:
-- Accuracy: 92% (seems good)
-- FSS: 1.2 (clearly terrible - reveals the problem)
+Class 0 (Lone-Lone) dominates with ~92% of all edges. A trivial model predicting all Class 0 achieves 92% accuracy but FSS ~1.2. **Always use FSS, not accuracy.**
 
 ### Lesson 2: Focal Loss Helps, But Doesn't Solve the Core Issue
 
-Notice that our top 2 models both use **focal loss** (γ=2.0), while inverse-weighted models perform worse:
+Focal loss improves FSS by ~0.5 over inverse weighting, but the ceiling remains around 2.75.
 
-| Loss Function | Best FSS | Best Accuracy | Notes |
-|---------------|----------|---------------|-------|
-| **Focal (γ=2.0)** | **2.75** | 95.1% | Best overall |
-| Inverse | 2.31 | 86.4% | Worse accuracy, lower FSS |
-| Logarithmic | 2.22 | 93.7% | Mid-range |
+### Lesson 3: More Features Don't Always Help
 
-**What this tells us:** Focal loss helps (especially with class imbalance), but even the best focal loss model only reaches FSS 2.75. The ceiling isn't loss function-related.
-
-### Lesson 3: More Features Don't Always Help (Surprising Finding!)
-
-Counter-intuitively, **all-features mode (42+ features) performed WORSE than baseline (3 features):**
-
-| Model | Features | FSS | Accuracy | Macro F1 |
-|-------|----------|-----|----------|----------|
-| SAGE + focal | Baseline (3) | **2.75** | 95.1% | 0.55 |
-| SAGE + inverse | All (42+) | 2.31 | 86.4% | 0.46 |
-
-**Possible explanations:**
-1. **Overfitting:** 42+ features on 1.2M edges may cause overfitting despite regularization
-2. **Noise in features:** Some features (noise_category, cluster_id_norm) may be correlated with the label in ways that hurt generalization
-3. **Redundancy:** The extra features may not add independent signal
-
-**What we learned:** More data isn't always better. Feature engineering requires careful selection.
+All-features mode (42+ features) performed WORSE than baseline (3 features) in several cases.
 
 ### Lesson 4: Architecture Differences Are Smaller Than Expected
 
-Despite large architectural differences, performance varies only modestly:
-
-| Architecture | Best FSS | Best Macro F1 | Notes |
-|--------------|----------|---------------|-------|
-| GraphSAGE | **2.75** | 0.55 | Winner (8 layers, focal) |
-| Transformer | 2.63 | 0.53 | Attention doesn't help much |
-| GCN | 2.23 | 0.45 | Simpler, but worse |
-| GAT | 2.19 | 0.44 | Attention without global context? |
-
-**Key insight:** The gap between SAGE (best) and GCN (worst) is only ~0.5 FSS. All architectures seem to hit a similar ceiling around FSS 2.5-2.8.
+The gap between best (SAGE) and worst (GCN) is only ~0.5 FSS.
 
 ### Lesson 5: The Core Issue May Be Graph Construction Itself
 
-Given that:
-- ✅ We tried 4 different architectures (GCN, GAT, Transformer, SAGE)
-- ✅ We tried 3 loss functions (focal, inverse, logarithmic)
-- ✅ We tried 2 feature sets (baseline vs all 42+)
-- ✅ We varied hyperparameters (layers, heads, learning rate)
-- ❌ Best FSS still only **2.75** (55% of perfect)
-
-**Our current hypothesis:** We're framing this as a **node classification with fixed graph** problem, but physics suggests it should be a **graph learning problem**.
-
-**The physics reality:**
-- A single calorimeter cell can receive energy from **multiple overlapping particle showers**
-- In high-energy environments, clusters **overlap spatially**
-- A cell doesn't belong to a single cluster - it has **fractional energy contributions** from multiple clusters
-
-**The mismatch in our current approach:**
-```
-Reality:                     Our Model:
-┌─────────────────┐          ┌─────────────────┐
-│  Cluster A      │          │  Node: Cell X   │
-│    ┌───┐        │          │  Question:      │
-│    │ X │ 30%    │          │  "Which single  │
-│    └───┘        │          │   cluster does  │
-│         Cluster │          │   this cell     │
-│         B 70%   │          │   belong to?"   │
-└─────────────────┘          └─────────────────┘
-                             
-Problem: The question itself may be wrong!
-Cell X belongs to BOTH clusters (30% A, 70% B)
-```
-
-### Why This Explains Our Results
-
-| Observation | Explanation under Graph Learning Hypothesis |
-|-------------|---------------------------------------------|
-| Best FSS stuck at 2.75 | Hard labels can't represent fractional membership |
-| SAGE > Transformer | Local aggregation may be better for overlapping clusters than global attention |
-| More features hurt | Adding cluster_id_norm may "bake in" hard assignments |
-| Focal loss helps but limited | Focal helps with imbalance but can't fix wrong label formulation |
+Cells can receive energy from multiple overlapping particle showers, but our hard-label formulation assumes single-cluster membership.
 
 ### The Graph Learning Hypothesis
 
-We suspect the right approach is to **learn the graph structure itself** rather than classify edges on a fixed graph:
-
-| Current Approach (Edge Classification) | Proposed Approach (Graph Learning) |
-|----------------------------------------|-------------------------------------|
-| Fixed graph from geometric neighbors | Learn which cells should be connected |
-| Each edge has a single label (0-4) | Each edge has a weight/strength |
-| Hard assignment to one cluster | Soft assignment to multiple clusters |
-| Assumes clusters are disjoint | Allows overlapping clusters |
-| One prediction per edge | Learned adjacency matrix |
-
-**What success might look like:** Instead of predicting Class 1 (same cluster) vs Class 4 (different clusters), predict a continuous value: "probability these cells share energy"
+We believe the right approach is to **learn the graph structure itself** rather than classify edges on a fixed graph. Masked pretraining is a step in this direction - learning general representations that may transfer better to the clustering task.
 
 ### Future Directions
 
-Based on our analysis, here are promising research directions:
+#### Direction 1: Masked Pretraining (NOW AVAILABLE!) 🆕
+We have implemented BERT/MAE-style masked pretraining. Key questions to investigate:
+- Does pretraining improve FSS over training from scratch?
+- Which masking strategy (random, feature, geometry, cluster) works best?
+- How does pretraining affect rare class performance (Classes 1 and 4)?
 
-#### Direction 1: Soft Edge Prediction (Most Feasible)
-Instead of 5 classes, predict:
-- **Probability of sharing energy** (continuous from 0 to 1)
-- **Uncertainty quantification** per prediction
-- **Expected energy fraction** rather than hard label
+#### Direction 2: Soft Edge Prediction
+Instead of 5 hard classes, predict continuous energy-sharing probabilities.
 
-#### Direction 2: Graph Learning / Differentiable Graph Generation
-- Learn the adjacency matrix directly
-- Allow fractional edge weights
-- Use graph generation techniques (e.g., GraphVAE, EDGE, DiGress)
+#### Direction 3: Graph Learning
+Learn the adjacency matrix directly rather than classifying fixed edges.
 
-#### Direction 3: Hypergraph or Multi-Graph Representations
-- One cell → multiple cluster memberships
-- Hypergraph where hyperedges represent clusters
-- Multi-layer graph (one layer per possible cluster)
+#### Direction 4: Hypergraph Representations
+Allow cells to belong to multiple clusters simultaneously.
 
-#### Direction 4: Energy Flow as Edge Weights
-- Use actual energy sharing information (if available from simulation)
-- Train on data with known fractional contributions
-- Predict energy fractions rather than hard labels
+### Practical Recommendations
 
-### Practical Recommendations for Users of This Code
-
-If you're using CaloGraphNet and encountering similar limitations:
-
-1. **Don't trust accuracy** - A model with 95% accuracy might still have FSS < 3.0
-2. **Compute FSS after every experiment** - It's the only reliable metric
-3. **Use focal loss** - It consistently outperforms inverse weighting
-4. **Start with baseline features** - All-features mode may hurt more than help
-5. **SAGE seems best** - GraphSAGE with 8 layers and focal loss is our top performer
-6. **Check per-class F1** - If Classes 1 and 4 have low F1, you may have overlapping clusters
-
-### What 2.75 FSS Actually Means
-
-An FSS of 2.75 means:
-- On average, each class achieves F1 ≈ 0.55
-- Random guessing would be F1 ≈ 0.20 per class (FSS = 1.0)
-- Perfect would be F1 = 1.00 per class (FSS = 5.0)
-- We're about halfway between random and perfect
-
-**Example of Class-specific performance**
-
-| Class | Example F1 | Interpretation |
-|-------|-----------|----------------|
-| Class 0 (Lone-Lone) | ~0.92 | Very good (easy class) |
-| Class 1 (Same Cluster) | ~0.45 | Poor - can't identify same-cluster pairs |
-| Class 2 (Source Only) | ~0.55 | Moderate |
-| Class 3 (Dest Only) | ~0.55 | Moderate |
-| Class 4 (Different Clusters) | ~0.28 | Very poor - can't separate different clusters |
-
-**The gap between Class 1 and Class 4 F1 is particularly telling:** The model can't distinguish "same cluster" from "different clusters" - which is exactly what you'd expect if clusters overlap!
+1. **Don't trust accuracy** - Use FSS
+2. **Try pretraining** - Especially cluster masking for physics alignment
+3. **Use focal loss** - Consistently outperforms inverse weighting
+4. **Start with baseline features** - All-features may hurt
+5. **SAGE seems best** - For supervised training
+6. **Compare pretrained vs scratch** - Use `--include-pretrain-metrics`
 
 ### Summary Table of What We've Tried
 
 | Approach | What We Did | Best Result | Lesson |
 |----------|-------------|-------------|--------|
-| **Metrics** | Accuracy → FSS | 2.75 FSS max | Accuracy is useless (92% trivial baseline) |
-| **Features** | Baseline (3) → All (42+) | Worse performance | More isn't better; feature engineering matters |
-| **Loss** | CrossEntropy → Focal | +0.5 FSS improvement | Focal helps with imbalance |
-| **Architecture** | GCN → SAGE → Transformer | SAGE best (2.75) | Differences are small (~0.5 FSS range) |
-| **Graph** | Fixed geometric neighbors | Stuck at 2.75 FSS | **Root cause: graph assumption fails** |
+| **Metrics** | Accuracy → FSS | 2.75 FSS max | Accuracy is useless |
+| **Features** | Baseline → All (42+) | Worse performance | More isn't better |
+| **Loss** | CrossEntropy → Focal | +0.5 FSS | Focal helps with imbalance |
+| **Architecture** | GCN → SAGE → Transformer | SAGE best (2.75) | Differences are small |
+| **Pretraining** 🆕 | Masked reconstruction → Finetune | *Under investigation* | May learn better representations |
+| **Graph** | Fixed geometric neighbors | Stuck at 2.75 FSS | **Root cause** |
 
-### Open Questions for the Community
+### Open Questions
 
-We welcome input and collaboration on these questions:
-
-1. Has anyone successfully applied **soft edge prediction** (continuous labels) to calorimeter clustering?
-2. Are there public datasets with **fractional energy contributions** per cell per cluster?
-3. Could **graph generative models** (DiGress, GraphARM) learn overlapping cluster assignments?
-4. Is **hypergraph representation** more appropriate for overlapping particle showers?
-5. For those who've tried both: does **soft clustering** outperform hard classification on similar problems?
+1. Does masked pretraining improve FSS for rare classes?
+2. Which masking strategy best aligns with physics reconstruction?
+3. Can soft edge prediction overcome the hard-label limitation?
+4. Are there public datasets with fractional energy contributions?
 
 ### Conclusion
 
-CaloGraphNet successfully:
-- ✅ Builds graph datasets from ROOT files
-- ✅ Trains multiple GNN architectures (GCN, GAT, Transformer, SAGE)
-- ✅ Provides comprehensive analysis tools (ROC, PR curves, FSS, HTML reports)
+CaloGraphNet now provides:
+- ✅ Graph dataset building from ROOT files
+- ✅ Multiple GNN architectures (GCN, GAT, Transformer, SAGE)
+- ✅ **Masked pretraining** with 4 strategies 🆕
+- ✅ Comprehensive analysis tools (ROC, PR, FSS, HTML reports)
+- ✅ **Pretraining analysis** and comparison 🆕
 
-However, it has revealed a fundamental limitation: **edge classification on a fixed geometric graph may be insufficient for overlapping particle clusters.** The best model (SAGE + focal loss) achieves FSS 2.75 - far from perfect.
+The best supervised model achieves FSS 2.75. We believe pretraining and soft labeling are promising directions for improvement.
 
-We believe the path forward lies in:
-1. **Soft labels** (continuous energy fractions instead of hard cluster assignments)
-2. **Graph learning** (learn the graph structure, don't fix it)
-3. **Hypergraph representations** (capture multi-cell energy sharing)
+---
 
-We hope this honest assessment helps others avoid similar pitfalls and inspires new approaches to this challenging problem.
+*We hope this honest assessment and the new pretraining capabilities help advance calorimeter clustering research.*
