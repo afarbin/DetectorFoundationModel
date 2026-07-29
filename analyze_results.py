@@ -3,9 +3,12 @@
 analyze_results.py - Comprehensive Model Analysis for CaloGraphNet
 
 Generates ROC curves, PR curves, confusion matrices, comparison plots,
-and HTML reports for trained GNN models.
+and HTML reports for trained GNN models (including pretrained models).
 
 Primary metric: F1 Sum Score (FSS) - balances precision AND recall.
+
+UPDATED: Handles pretraining metrics, pretrain loss curves, and
+pretrain-vs-scratch comparisons.
 """
 
 import os
@@ -52,7 +55,7 @@ BLUE_COLORMAP = LinearSegmentedColormap.from_list("blue_grad", ["#e3f2fd", "#0d4
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description='Analyze trained CaloGraphNet models',
+        description='Analyze trained CaloGraphNet models (including pretrained)',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
@@ -70,6 +73,8 @@ def parse_args():
                         help='Batch size for parquet reading (default: 100000)')
     parser.add_argument('--top-n', type=int, default=5,
                         help='Number of top models to show in radar chart (default: 5)')
+    parser.add_argument('--include-pretrain-metrics', action='store_true',
+                        help='Include pretraining metrics in analysis (if available)')
     
     return parser.parse_args()
 
@@ -83,6 +88,7 @@ def create_output_structure(output_dir):
         'comparison_plots': os.path.join(output_dir, 'figures', 'comparison_plots'),
         'metrics_radar': os.path.join(output_dir, 'figures', 'metrics_radar'),
         'loss_curves': os.path.join(output_dir, 'figures', 'loss_curves'),
+        'pretrain_metrics': os.path.join(output_dir, 'figures', 'pretrain_metrics'),
         'tables': os.path.join(output_dir, 'tables'),
         'reports': os.path.join(output_dir, 'reports'),
         'data': os.path.join(output_dir, 'data'),
@@ -97,6 +103,7 @@ def create_output_structure(output_dir):
 def extract_model_metrics(metrics):
     """
     Extract comprehensive metrics from training output.
+    Updated to handle pretraining metrics and correct loss key names.
     
     Priority order for model selection:
     1. F1 Sum Score (FSS) - accounts for both FP and FN [BEST]
@@ -123,14 +130,22 @@ def extract_model_metrics(metrics):
         # Accuracy
         'accuracy': metrics.get('best_accuracy', 0.0),
 
-        # Loss data
-        'train_losses': metrics.get('train_losses', []),
-        'val_losses': metrics.get('val_losses', []),
-        'test_losses': metrics.get('test_losses', []),
+        # Loss data (corrected keys: 'train_loss' not 'train_losses')
+        'train_losses': metrics.get('train_loss', metrics.get('train_losses', [])),
+        'val_losses': metrics.get('val_loss', metrics.get('val_losses', [])),
+        'test_losses': metrics.get('test_loss', metrics.get('test_losses', [])),
         'test_epochs': metrics.get('test_epochs', []),
         
         # Training info
         'best_epoch': metrics.get('best_epoch', '?'),
+        'total_time': metrics.get('total_time', 0.0),
+        
+        # Pretraining info (NEW)
+        'pretrained': False,
+        'pretrain_loss': None,
+        'pretrain_mask_type': None,
+        'pretrain_mask_ratio': None,
+        'pretrain_epochs': None,
         
         # Per-class metrics
         'per_class_recall': {},
@@ -144,7 +159,10 @@ def extract_model_metrics(metrics):
         for key in [f'best_recall_class_{c}', f'test_recall_class_{c}']:
             if key in metrics:
                 val = metrics[key]
-                extracted['per_class_recall'][c] = max(val) if isinstance(val, list) else val
+                if isinstance(val, list) and len(val) > 0:
+                    extracted['per_class_recall'][c] = float(max(val))
+                elif not isinstance(val, list):
+                    extracted['per_class_recall'][c] = float(val)
                 break
         else:
             extracted['per_class_recall'][c] = 0.0
@@ -153,7 +171,10 @@ def extract_model_metrics(metrics):
         for key in [f'best_precision_class_{c}', f'test_precision_class_{c}']:
             if key in metrics:
                 val = metrics[key]
-                extracted['per_class_precision'][c] = max(val) if isinstance(val, list) else val
+                if isinstance(val, list) and len(val) > 0:
+                    extracted['per_class_precision'][c] = float(max(val))
+                elif not isinstance(val, list):
+                    extracted['per_class_precision'][c] = float(val)
                 break
         else:
             extracted['per_class_precision'][c] = 0.0
@@ -162,10 +183,35 @@ def extract_model_metrics(metrics):
         for key in [f'best_f1_class_{c}', f'test_f1_class_{c}']:
             if key in metrics:
                 val = metrics[key]
-                extracted['per_class_f1'][c] = max(val) if isinstance(val, list) else val
+                if isinstance(val, list) and len(val) > 0:
+                    extracted['per_class_f1'][c] = float(max(val))
+                elif not isinstance(val, list):
+                    extracted['per_class_f1'][c] = float(val)
                 break
         else:
             extracted['per_class_f1'][c] = 0.0
+    
+    # Check for pretraining from model args
+    model_args = metrics.get('args', {})
+    if model_args.get('pretrain', False):
+        extracted['pretrained'] = True
+        extracted['pretrain_mask_type'] = model_args.get('mask_type', 'unknown')
+        extracted['pretrain_mask_ratio'] = model_args.get('mask_ratio', 0.0)
+        extracted['pretrain_epochs'] = model_args.get('pretrain_epochs', 0)
+    
+    # Also check experiment name for 'pretrain' keyword
+    exp_name = model_args.get('exp_name', '')
+    if 'pretrain' in exp_name.lower():
+        extracted['pretrained'] = True
+    
+    # Look for final_inference_metrics
+    if 'final_inference_metrics' in metrics:
+        final = metrics['final_inference_metrics']
+        if final.get('f1_sum_score', 0) > 0:
+            if final.get('f1_sum_score', 0) > extracted['f1_sum_score']:
+                extracted['f1_sum_score'] = final['f1_sum_score']
+                extracted['accuracy'] = final.get('accuracy', extracted['accuracy'])
+                extracted['macro_f1'] = final.get('macro_f1', extracted['macro_f1'])
     
     # Fallback: compute FSS from RSS if needed
     if extracted['f1_sum_score'] == 0.0 and extracted['randomness_metric'] > 0:
@@ -175,6 +221,18 @@ def extract_model_metrics(metrics):
         extracted['f1_is_fallback'] = False
     
     return extracted
+
+
+def load_pretrain_metrics(models_dir, model_name):
+    """Load pretraining metrics if they exist."""
+    pretrain_path = os.path.join(models_dir, f"pretrain_metrics_{model_name}.pkl")
+    if os.path.exists(pretrain_path):
+        try:
+            with open(pretrain_path, 'rb') as f:
+                return pickle.load(f)
+        except Exception:
+            pass
+    return None
 
 
 def compute_roc_data(parquet_dir, model_name, max_rows, batch_size):
@@ -373,10 +431,10 @@ def plot_loss_curves(model_name, metrics, folders):
     """Generate training and testing loss curves."""
     print(f"      Plotting loss curves...")
     
-    # Check if loss data exists
-    train_losses = metrics.get('train_losses', [])
-    val_losses = metrics.get('val_losses', [])
-    test_losses = metrics.get('test_losses', [])
+    # Check if loss data exists (try both key formats)
+    train_losses = metrics.get('train_loss', metrics.get('train_losses', []))
+    val_losses = metrics.get('val_loss', metrics.get('val_losses', []))
+    test_losses = metrics.get('test_loss', metrics.get('test_losses', []))
     
     if not train_losses and not val_losses and not test_losses:
         print("      No loss data available")
@@ -409,7 +467,6 @@ def plot_loss_curves(model_name, metrics, folders):
     
     # Testing loss (if available)
     ax2 = axes[1]
-    test_losses = metrics.get('test_losses', [])
     test_epochs = metrics.get('test_epochs', [])
     
     if test_losses:
@@ -500,6 +557,158 @@ def plot_loss_comparison(all_results, folders):
                 dpi=150, bbox_inches='tight')
     plt.close()
     print("   Done: Loss comparison plot saved")
+
+
+def plot_pretrain_loss_curves(all_results, folders):
+    """Plot pretraining loss curves for models that were pretrained."""
+    pretrained_models = [r for r in all_results if r.get('pretrained', False)]
+    
+    if not pretrained_models:
+        return
+    
+    print("\n      Plotting pretraining loss curves...")
+    
+    # Load actual pretrain metrics files
+    pretrain_data = []
+    for model in pretrained_models:
+        pretrain_metrics = load_pretrain_metrics(args.models_dir, model['name'])
+        if pretrain_metrics:
+            pretrain_data.append({
+                'name': model['name'],
+                'metrics': pretrain_metrics
+            })
+    
+    if not pretrain_data:
+        print("      No pretraining metrics files found")
+        return
+    
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+    
+    # Pretraining loss curves
+    ax1 = axes[0]
+    colors = plt.cm.Set1(np.linspace(0, 1, len(pretrain_data)))
+    
+    for idx, data in enumerate(pretrain_data):
+        metrics_list = data['metrics']
+        if isinstance(metrics_list, list) and metrics_list:
+            epochs = [m['epoch'] for m in metrics_list]
+            losses = [m['loss'] for m in metrics_list]
+            ax1.plot(epochs, losses, '-', color=colors[idx], linewidth=1.5, alpha=0.7,
+                    label=f"{data['name'][:25]}")
+    
+    ax1.set_xlabel('Epoch', fontsize=12)
+    ax1.set_ylabel('Reconstruction Loss', fontsize=12)
+    ax1.set_title('Pretraining Loss Curves', fontsize=14, fontweight='bold')
+    ax1.legend(fontsize=8, loc='upper right')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_yscale('log')
+    
+    # Mask ratio evolution
+    ax2 = axes[1]
+    for idx, data in enumerate(pretrain_data):
+        metrics_list = data['metrics']
+        if isinstance(metrics_list, list) and metrics_list and 'mask_ratio' in metrics_list[0]:
+            epochs = [m['epoch'] for m in metrics_list]
+            mask_ratios = [m['mask_ratio'] for m in metrics_list]
+            ax2.plot(epochs, mask_ratios, '-', color=colors[idx], linewidth=1.5, alpha=0.7,
+                    label=data['name'][:25])
+    
+    ax2.set_xlabel('Epoch', fontsize=12)
+    ax2.set_ylabel('Mask Ratio', fontsize=12)
+    ax2.set_title('Mask Ratio During Pretraining', fontsize=14, fontweight='bold')
+    ax2.legend(fontsize=8)
+    ax2.grid(True, alpha=0.3)
+    
+    plt.suptitle('Pretraining Analysis', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(folders['pretrain_metrics'], "pretraining_curves.png"), 
+                dpi=150, bbox_inches='tight')
+    plt.close()
+    print("      Done: Pretraining curves saved")
+
+
+def plot_finetune_vs_scratch_comparison(all_results, folders):
+    """Compare pretrained+finetuned vs scratch models."""
+    pretrained = [r for r in all_results if r.get('pretrained', False)]
+    scratch = [r for r in all_results if not r.get('pretrained', False)]
+    
+    if not pretrained or not scratch:
+        return
+    
+    print("\n      Creating pretrain vs scratch comparison...")
+    
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    
+    # F1 Sum Score comparison
+    ax1 = axes[0]
+    
+    pretrained_fss = [r['f1_sum_score'] for r in pretrained]
+    scratch_fss = [r['f1_sum_score'] for r in scratch]
+    
+    positions = [1, 2]
+    data = [scratch_fss, pretrained_fss]
+    labels = [f'Scratch\n(n={len(scratch)})', 
+              f'Pretrained+Finetuned\n(n={len(pretrained)})']
+    box_colors = ['#3498db', '#2ecc71']
+    
+    bp = ax1.boxplot(data, positions=positions, patch_artist=True, widths=0.4)
+    for patch, color in zip(bp['boxes'], box_colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.6)
+    
+    # Add individual points
+    for i, (d, pos) in enumerate(zip(data, positions)):
+        x = np.random.normal(pos, 0.04, size=len(d))
+        ax1.scatter(x, d, alpha=0.6, color=box_colors[i], edgecolors='black', linewidth=0.5)
+    
+    ax1.set_xticks(positions)
+    ax1.set_xticklabels(labels)
+    ax1.set_ylabel('F1 Sum Score', fontsize=12)
+    ax1.set_title('Pretraining Impact on F1 Sum Score', fontsize=14, fontweight='bold')
+    ax1.grid(True, alpha=0.3, axis='y')
+    ax1.axhline(y=1.0, color='red', linestyle='--', alpha=0.5, label='Random baseline')
+    
+    # Add mean values
+    for i, (d, pos) in enumerate(zip(data, positions)):
+        if d:
+            mean_val = np.mean(d)
+            ax1.annotate(f'μ={mean_val:.2f}', xy=(pos, mean_val), 
+                        xytext=(pos + 0.2, mean_val + 0.05),
+                        fontweight='bold', fontsize=10, color=box_colors[i])
+    
+    # Per-class F1 comparison
+    ax2 = axes[1]
+    
+    if pretrained and scratch:
+        best_pretrained = max(pretrained, key=lambda x: x['f1_sum_score'])
+        best_scratch = max(scratch, key=lambda x: x['f1_sum_score'])
+        
+        x = np.arange(5)
+        width = 0.35
+        
+        pretrained_f1 = [best_pretrained['per_class_f1'].get(c, 0) for c in range(5)]
+        scratch_f1 = [best_scratch['per_class_f1'].get(c, 0) for c in range(5)]
+        
+        ax2.bar(x - width/2, scratch_f1, width, 
+                label=f'Best Scratch (FSS={best_scratch["f1_sum_score"]:.2f})', 
+                color='#3498db', alpha=0.7)
+        ax2.bar(x + width/2, pretrained_f1, width, 
+                label=f'Best Pretrained (FSS={best_pretrained["f1_sum_score"]:.2f})', 
+                color='#2ecc71', alpha=0.7)
+        
+        ax2.set_xlabel('Class', fontsize=12)
+        ax2.set_ylabel('F1 Score', fontsize=12)
+        ax2.set_title('Per-Class F1: Best Scratch vs Best Pretrained', fontsize=14, fontweight='bold')
+        ax2.set_xticks(x)
+        ax2.set_xticklabels([CLASS_NAMES[i].split(' (')[0] for i in range(5)], rotation=45, ha='right')
+        ax2.legend(fontsize=9)
+        ax2.grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(folders['comparison_plots'], "pretrain_vs_scratch.png"), 
+                dpi=150, bbox_inches='tight')
+    plt.close()
+    print("      Done: Pretrain vs scratch comparison saved")
 
 
 def plot_confusion_matrix_enhanced(model_name, extracted, folders, class_names, class_colors, max_rows, batch_size):
@@ -694,8 +903,42 @@ def plot_metric_comparison(all_results, folders, class_names):
 
 
 def generate_html_report(all_results, df_display, folders, class_names, datetime_str):
-    """Generate comprehensive HTML report."""
+    """Generate comprehensive HTML report with pretraining info."""
     top_model = df_display.iloc[0]
+    
+    # Check if any models were pretrained
+    pretrained_models = [r for r in all_results if r.get('pretrained', False)]
+    has_pretrained = len(pretrained_models) > 0
+    
+    # Pretraining section
+    pretrain_section = ""
+    if has_pretrained:
+        pretrain_section = f"""
+        <div class="container">
+            <h2>🔧 Pretraining Analysis</h2>
+            <p style="color: #555; margin-bottom: 20px;">
+                <strong>{len(pretrained_models)} models</strong> were pretrained using masked reconstruction before finetuning.
+            </p>
+            <h3>Pretraining Strategies Used:</h3>
+            <ul>
+        """
+        mask_types = set(m.get('pretrain_mask_type', 'unknown') for m in pretrained_models)
+        for mt in mask_types:
+            models_with_mt = [m for m in pretrained_models if m.get('pretrain_mask_type') == mt]
+            ratios = set(m.get('pretrain_mask_ratio', 0) for m in models_with_mt)
+            pretrain_section += f"""
+                <li><strong>{mt.capitalize()} Masking</strong>: {len(models_with_mt)} models (ratio: {', '.join(f'{r:.2f}' for r in ratios)})</li>
+            """
+        pretrain_section += """
+            </ul>
+            <img src="../figures/pretrain_metrics/pretraining_curves.png" alt="Pretraining Curves" style="max-width: 100%;">
+        </div>
+        
+        <div class="container">
+            <h2>Pretraining Impact</h2>
+            <img src="../figures/comparison_plots/pretrain_vs_scratch.png" alt="Pretrain vs Scratch">
+        </div>
+        """
     
     html_report = f"""<!DOCTYPE html>
 <html>
@@ -713,6 +956,7 @@ def generate_html_report(all_results, df_display, folders, class_names, datetime
         .stat-box.f1 {{ background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%); color: #1a5e20; }}
         .stat-box.macro {{ background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); color: #1a237e; }}
         .stat-box.accuracy {{ background: linear-gradient(135deg, #fa709a 0%, #fee140 100%); color: #4a1a1a; }}
+        .stat-box.pretrain {{ background: linear-gradient(135deg, #a18cd1 0%, #fbc2eb 100%); color: #4a1a5e; }}
         .stat-number {{ font-size: 48px; font-weight: bold; }}
         .stat-label {{ font-size: 14px; opacity: 0.9; margin-top: 5px; }}
         .metric-explanation {{ background: #f8f9fa; padding: 15px; border-radius: 8px; margin: 20px 0; }}
@@ -721,6 +965,9 @@ def generate_html_report(all_results, df_display, folders, class_names, datetime
         th {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 12px; text-align: center; }}
         td {{ padding: 10px; text-align: center; border-bottom: 1px solid #e0e0e0; }}
         tr:hover {{ background-color: #f5f5f5; }}
+        .badge {{ display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: bold; }}
+        .badge-pretrained {{ background: #a18cd1; color: white; }}
+        .badge-scratch {{ background: #3498db; color: white; }}
     </style>
 </head>
 <body>
@@ -754,8 +1001,15 @@ def generate_html_report(all_results, df_display, folders, class_names, datetime
                     <div class="stat-label">Accuracy</div>
                     <small>Overall correctness</small>
                 </div>
+                {f'''<div class="stat-box pretrain">
+                    <div class="stat-number">{len(pretrained_models)}</div>
+                    <div class="stat-label">Pretrained Models</div>
+                    <small>Masked pretraining + finetuning</small>
+                </div>''' if has_pretrained else ''}
             </div>
         </div>
+        
+        {pretrain_section}
         
         <div class="container">
             <h2>Loss Curves Comparison</h2>
@@ -780,6 +1034,10 @@ def generate_html_report(all_results, df_display, folders, class_names, datetime
         
         <div class="container">
             <h2>Top 10 Models (Ranked by F1 Sum Score)</h2>
+            <p style="color: #555; margin-bottom: 10px;">
+                <span class="badge badge-pretrained">🔧 Pretrained</span> = Masked pretraining + finetuning
+                <span class="badge badge-scratch">📊 Scratch</span> = Trained from scratch
+            </p>
             {df_display.head(10).to_html(index=False)}
         </div>
         
@@ -808,28 +1066,32 @@ def generate_html_report(all_results, df_display, folders, class_names, datetime
 
 
 def main():
-    global args  # Make args available to functions
+    global args
     args = parse_args()
     
     print("="*100)
-    print("CaloGraphNet - Model Analysis Suite")
+    print("CaloGraphNet - Model Analysis Suite (incl. Pretraining)")
     print("="*100)
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"\n[PRIMARY METRIC] F1 Sum Score (FSS) - balances Precision AND Recall")
     print(f"   Models directory: {args.models_dir}")
     print(f"   Parquet directory: {args.parquet_dir}")
     print(f"   Output directory: {args.output_dir}")
+    if args.include_pretrain_metrics:
+        print(f"   Including pretraining metrics")
     
     # Create output structure
     folders = create_output_structure(args.output_dir)
     
-    # Find all models
+    # Find all models (exclude pretrain_metrics files)
     pkl_files = sorted(glob.glob(os.path.join(args.models_dir, "*_metrics.pkl")))
+    pkl_files = [f for f in pkl_files if 'pretrain_metrics' not in os.path.basename(f)]
     model_names = [os.path.basename(f).replace("_metrics.pkl", "") for f in pkl_files]
     
     print(f"\nFound {len(model_names)} models:")
     for name in model_names:
-        print(f"   - {name}")
+        is_pretrained = 'pretrain' in name.lower()
+        print(f"   {'🔧' if is_pretrained else '  '} - {name}")
     
     all_results = []
     
@@ -845,7 +1107,7 @@ def main():
             with open(pkl_path, 'rb') as f:
                 metrics = pickle.load(f)
             
-            # Extract metrics
+            # Extract metrics (now handles pretraining info)
             extracted = extract_model_metrics(metrics)
             
             # Get model configuration
@@ -857,6 +1119,9 @@ def main():
                 'architecture': model_args.get('model', 'unknown'),
                 'loss': model_args.get('weight_strategy', 'cross_entropy') if model_args.get('weighted_loss', False) else 'cross_entropy',
                 'features': 'baseline' if model_args.get('baseline', True) else 'all_features',
+                'pretrained': extracted.get('pretrained', False),
+                'pretrain_mask_type': extracted.get('pretrain_mask_type', None),
+                'pretrain_mask_ratio': extracted.get('pretrain_mask_ratio', None),
                 **extracted
             }
             all_results.append(result)
@@ -888,6 +1153,11 @@ def main():
     plot_metric_comparison(all_results, folders, CLASS_NAMES)
     plot_loss_comparison(all_results, folders)
     
+    # Pretraining-specific plots (if requested)
+    if args.include_pretrain_metrics:
+        plot_pretrain_loss_curves(all_results, folders)
+        plot_finetune_vs_scratch_comparison(all_results, folders)
+    
     print("\n" + "="*100)
     print("PHASE 3: Generating Tables and Reports")
     print("="*100)
@@ -901,13 +1171,15 @@ def main():
                                    bins=[0, 1.5, 2.5, 3.5, 4.5, 5.0],
                                    labels=['1★', '2★', '3★', '4★', '5★'])
     
-    # Select columns for display
-    display_columns = ['name', 'architecture', 'loss', 'features', 'Rating',
+    # Select columns for display (including pretraining info)
+    display_columns = ['name', 'architecture', 'pretrained', 'loss', 'features', 'Rating',
                       'f1_sum_score', 'weighted_f1_score', 'randomness_metric',
                       'macro_f1', 'macro_recall', 'macro_precision', 'accuracy', 'best_epoch']
     
     df_display = df_summary[[c for c in display_columns if c in df_summary.columns]].copy()
     df_display.columns = [c.replace('_', ' ').title() for c in df_display.columns]
+    if 'Pretrained' in df_display.columns:
+        df_display['Pretrained'] = df_display['Pretrained'].map({True: '🔧 Yes', False: '📊 No'})
     
     # Save CSV
     df_summary.to_csv(os.path.join(folders['data'], "comprehensive_metrics.csv"), index=False)
@@ -931,7 +1203,7 @@ def main():
     styled.to_html(os.path.join(folders['tables'], "comprehensive_table.html"))
     print("   Saved: comprehensive_table.html")
     
-    # Generate HTML report
+    # Generate HTML report with pretraining info
     generate_html_report(all_results, df_display, folders, CLASS_NAMES, 
                         datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
     
@@ -943,7 +1215,8 @@ def main():
     print("\nTOP 5 MODELS (by F1 Sum Score):")
     for i, (_, row) in enumerate(df_display.head(5).iterrows(), 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}th"
-        print(f"   {medal} {row['Name'][:50]}: FSS={row['F1 Sum Score']:.2f}")
+        pretrain_badge = " [PRETRAINED]" if row.get('Pretrained', '') == '🔧 Yes' else ""
+        print(f"   {medal} {row['Name'][:50]}: FSS={row['F1 Sum Score']:.2f}{pretrain_badge}")
     
     print(f"\nAll outputs saved to: {args.output_dir}")
     print(f"Open report: {os.path.join(folders['reports'], 'master_report.html')}")
