@@ -37,7 +37,7 @@ import torch_geometric
 from torch_geometric.nn import GCNConv, GATConv, SAGEConv, TransformerConv
 from torch_geometric.nn import BatchNorm, LayerNorm
 from torch.nn import BatchNorm1d, LayerNorm as LayerNorm1d
-
+from torch_geometric.utils import to_undirected
 import pyarrow as pa
 import pyarrow.parquet as pq
 import h5py
@@ -234,7 +234,7 @@ def parse_args():
     parser.add_argument('--hidden-dim', type=int, default=128)
     parser.add_argument('--layers', '-l', type=int, default=6)
     parser.add_argument('--heads', type=int, default=2)
-    parser.add_argument('--dropout', type=float, default=0.0)
+    parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--layer-weights', action='store_true')
     parser.add_argument('--softmax-weights', action='store_true')
     parser.add_argument('--norm', type=str, default='batch', choices=['batch', 'layer', 'none'])
@@ -618,7 +618,8 @@ def load_features_with_selection(data_dir: str, args, tracker: Optional[Resource
     
     features_dict = {}; cluster_info = {}; feature_names = []
     if args.baseline and not args.all_features:
-        feature_names = ['snr', 'eta', 'phi']; input_dim = 3
+        feature_names = ['snr_scaled', 'snr_gt4', 'snr_gt2', 'snr_gt0',
+                         'eta', 'sin_phi', 'cos_phi']; input_dim = 7
     else:
         input_dim = 0
     
@@ -695,8 +696,12 @@ def load_features_with_selection(data_dir: str, args, tracker: Optional[Resource
                         bulk_datasets[fname] = h5f[fname][:]
                     elif fname == 'eta' and 'cell/cell_eta' in h5f:
                         bulk_datasets['eta'] = h5f['cell/cell_eta'][:]
-                    elif fname == 'phi' and 'cell/cell_phi' in h5f:
-                        bulk_datasets['phi'] = h5f['cell/cell_phi'][:]
+                    elif fname == 'sin_phi' and 'cell/cell_phi' in h5f:
+                        phi_val = bulk_datasets['phi'][local_idx]
+                        features_list.append(np.sin(phi_val).astype(np.float32))
+                    elif fname == 'cos_phi' and 'cell/cell_phi' in h5f:
+                        phi_val = bulk_datasets['phi'][local_idx]
+                        features_list.append(np.cos(phi_val).astype(np.float32))
                     elif fname == 'in_cluster' and 'cell/cell_cluster_index' in h5f:
                         bulk_datasets['cell_cluster_index'] = h5f['cell/cell_cluster_index'][:]
                 
@@ -723,7 +728,23 @@ def load_features_with_selection(data_dir: str, args, tracker: Optional[Resource
                     snr_row = snr_full[local_idx] if snr_full.ndim == 2 else snr_full
                     eta_row = eta_full[local_idx] if eta_full.ndim == 2 else eta_full
                     phi_row = phi_full[local_idx] if phi_full.ndim == 2 else phi_full
-                    features = np.stack([snr_row, eta_row, phi_row], axis=1).astype(np.float32)
+                    
+                    # ---- BUGFIX #5: φ sin/cos encoding for periodicity ----
+                    sin_phi = np.sin(phi_row).astype(np.float32)
+                    cos_phi = np.cos(phi_row).astype(np.float32)
+                    
+                    # ---- BUGFIX #7: SNR scaling + threshold indicators ----
+                    snr_f32 = snr_row.astype(np.float32)
+                    snr_scaled = np.sign(snr_f32) * np.log1p(np.abs(snr_f32))
+                    snr_gt4 = (np.abs(snr_f32) > 4).astype(np.float32)
+                    snr_gt2 = (np.abs(snr_f32) > 2).astype(np.float32)
+                    snr_gt0 = (np.abs(snr_f32) > 0).astype(np.float32)
+                    
+                    features = np.stack([
+                        snr_scaled, snr_gt4, snr_gt2, snr_gt0,
+                        eta_row, sin_phi, cos_phi
+                    ], axis=1).astype(np.float32)
+    
                 else:
                     features_list = []
                     for fname in feature_names:
@@ -854,12 +875,14 @@ class GraphFoundationModel(nn.Module):
             elif model_type == 'gat':
                 self.convs.append(
                     GATConv(hidden_dim, hidden_dim // num_heads,
-                           heads=num_heads, dropout=dropout)
+                           heads=num_heads, dropout=dropout,
+                           edge_dim=5)
                 )
             elif model_type == 'transformer':
                 self.convs.append(
                     TransformerConv(hidden_dim, hidden_dim // num_heads,
-                                   heads=num_heads, dropout=dropout)
+                                   heads=num_heads, dropout=dropout,
+                                    edge_dim=5)
                 )
             elif model_type == 'sage':
                 self.convs.append(SAGEConv(hidden_dim, hidden_dim))
@@ -906,42 +929,46 @@ class GraphFoundationModel(nn.Module):
                 feature_types.append('continuous')
         return feature_types if feature_types else ['continuous']
 
-    def encode(self, x_list, edge_index_list):
+    def encode(self, x_list, edge_index_list, edge_attr_list=None):
         """
-        Encode node features into embeddings (shared between pretraining and finetuning).
-        
-        Args:
-            x_list: List of node feature tensors
-            edge_index_list: List of edge index tensors
-            
-        Returns:
-            List of node embedding tensors
+        Encode node features into embeddings.
+        ...
         """
         weights = (
             torch.softmax(self.layer_weights, dim=0)
             if self.softmax else self.layer_weights
         ) if self.layer_weights_enabled else None
-
+    
         all_node_embeddings = []
         
-        for x, proc_edges in zip(x_list, edge_index_list):
+        for idx, (x, proc_edges) in enumerate(zip(x_list, edge_index_list)):
             x = x.to(self.device, non_blocking=True)
             proc_edges = proc_edges.to(self.device, non_blocking=True)
-
+            
+            # Get edge features for this graph
+            edge_attr = None
+            if edge_attr_list is not None and idx < len(edge_attr_list):
+                if edge_attr_list[idx] is not None:
+                    edge_attr = edge_attr_list[idx].to(self.device, non_blocking=True)
+    
             x_embed = self.node_embedding(x)
-
+    
             for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
-                h = torch.relu(bn(conv(x_embed, proc_edges)))
+                # Pass edge_attr to convs that support it
+                if edge_attr is not None and self.model_type in ['gat', 'transformer']:
+                    h = torch.relu(bn(conv(x_embed, proc_edges, edge_attr)))
+                else:
+                    h = torch.relu(bn(conv(x_embed, proc_edges)))
                 if weights is not None:
                     h = weights[i] * h
                 x_embed = x_embed + h
-
+    
             all_node_embeddings.append(x_embed)
             
         return all_node_embeddings
 
     def forward(self, x_list, edge_index_list, edge_index_out_list,
-                y_batch=None, mask=None):
+                y_batch=None, mask=None, edge_attr_list=None):
         """
         Forward pass supporting both pretraining and finetuning.
         
@@ -957,7 +984,7 @@ class GraphFoundationModel(nn.Module):
             For pretraining: (reconstructed features, mask)
         """
         # Encode node features
-        node_embeddings = self.encode(x_list, edge_index_list)
+        node_embeddings = self.encode(x_list, edge_index_list, edge_attr_list)
         
         if self.pretraining:
             # Reconstruction mode
@@ -1092,6 +1119,10 @@ class MaskedReconstructionLoss(nn.Module):
 # DATA GENERATOR
 # ============================================================================
 
+# Add this at the top of the file with other torch_geometric imports:
+from torch_geometric.utils import to_undirected
+
+
 class MultiClassBatchGenerator(IterableDataset):
     """
     Iterable dataset that streams graph samples in chunks to reduce memory
@@ -1102,7 +1133,8 @@ class MultiClassBatchGenerator(IterableDataset):
                  mode="train", is_bi_directional=True,
                  batch_size=1, train_ratio=0.7, debug=False,
                  unscaled_data_dict=None, cluster_info_dict=None,
-                 chunk_size=2000, inference_only=False):
+                 chunk_size=2000, inference_only=False,
+                 cells_array=None):
 
         # Store dataset configuration.
         self.debug = debug
@@ -1111,6 +1143,8 @@ class MultiClassBatchGenerator(IterableDataset):
         self.num_pairs = neighbor_pairs.shape[0]
         self.chunk_size = chunk_size
         self.inference_only = inference_only
+        self.is_bi_directional = is_bi_directional
+        self._cells_array = cells_array  # ← Store for edge feature computation
 
         # Store references to the underlying data.
         self._features_dict = features_dict
@@ -1123,14 +1157,25 @@ class MultiClassBatchGenerator(IterableDataset):
             neighbor_pairs, dtype=torch.long
         )
 
+        # ---- BUGFIX: Proper bidirectional edge handling ----
+        # Convert from (E, 2) to (2, E) format expected by PyG convs
+        raw_edges = self.neighbor_pairs.T.contiguous()
+
+        if self.is_bi_directional:
+            # Create undirected edges for message passing by adding reverse edges.
+            # Example: (0→1, 1→2) becomes (0→1, 1→0, 1→2, 2→1)
+            self.pairs_mp = to_undirected(raw_edges)
+            # Keep original directional edges for prediction so labels
+            # still align 1:1 with the edges being classified.
+            self.pairs_pred = raw_edges
+        else:
+            self.pairs_mp = raw_edges
+            self.pairs_pred = raw_edges
+
         # Pin memory to speed up CPU → GPU transfers.
         if torch.cuda.is_available():
-            self.neighbor_pairs = self.neighbor_pairs.pin_memory()
-
-        # Store the edge list in the format expected by PyTorch Geometric.
-        # Making it contiguous avoids repeated internal copies during graph
-        # convolutions.
-        self.pairs_t = self.neighbor_pairs.T.contiguous()
+            self.pairs_mp = self.pairs_mp.pin_memory()
+            self.pairs_pred = self.pairs_pred.pin_memory()
 
         # Split events into training and validation/test sets using the
         # actual event IDs instead of assuming consecutive numbering.
@@ -1148,7 +1193,7 @@ class MultiClassBatchGenerator(IterableDataset):
 
         log(
             f"📊 {mode.upper()} SET: {len(self.event_indices)} events "
-            f"[CUDA, chunk={chunk_size}{pin_msg}]"
+            f"[CUDA, chunk={chunk_size}, bidirectional={is_bi_directional}{pin_msg}]"
         )
 
         # Number of chunks required to process the dataset.
@@ -1158,6 +1203,69 @@ class MultiClassBatchGenerator(IterableDataset):
 
         # Storage for the currently loaded chunk.
         self._chunk_data = []
+
+    def _compute_edge_features(self, event_idx):
+        if self._cells_array is None:
+            return None
+        
+        features = self._features_dict[event_idx]
+        if isinstance(features, torch.Tensor):
+            features_np = features.numpy()
+        else:
+            features_np = features
+        
+        sin_phi = features_np[:, 5]   # was 2, now 5 in [snr_scaled, snr_gt4, snr_gt2, snr_gt0, eta, sin_phi, cos_phi]
+        cos_phi = features_np[:, 6]   # was 3, now 6
+        eta = features_np[:, 4]       # was 1, now 4
+        
+        # Use pairs_pred (original directional edges) for feature computation
+        # pairs_pred shape: (2, E) — we need to match this edge count
+        num_edges = self.pairs_pred.shape[1]
+        
+        src = self.pairs_pred[0, :num_edges].numpy()
+        dst = self.pairs_pred[1, :num_edges].numpy()
+        
+        deta = eta[src] - eta[dst]
+        dphi_sin = np.sin(np.arctan2(sin_phi[src], cos_phi[src]) - 
+                         np.arctan2(sin_phi[dst], cos_phi[dst]))
+        dphi_cos = np.cos(np.arctan2(sin_phi[src], cos_phi[src]) - 
+                         np.arctan2(sin_phi[dst], cos_phi[dst]))
+        dr = np.sqrt(deta**2 + np.arctan2(dphi_sin, dphi_cos)**2)
+        
+        if 'sampling' in self._cells_array.dtype.names:
+            sampling = self._cells_array['sampling']
+            same_layer = (sampling[src] == sampling[dst]).astype(np.float32)
+        else:
+            same_layer = np.ones(num_edges, dtype=np.float32)
+        
+        edge_attr = np.stack([
+            deta.astype(np.float32),
+            dphi_sin.astype(np.float32),
+            dphi_cos.astype(np.float32),
+            dr.astype(np.float32),
+            same_layer
+        ], axis=1)
+        
+        # If bidirectional, we need to expand edge features to match pairs_mp
+        # pairs_mp has original edges + reverse edges interleaved
+        if self.is_bi_directional:
+            # For reverse edges, negate deta, flip sin/cos of dphi
+            edge_attr_rev = edge_attr.copy()
+            edge_attr_rev[:, 0] = -edge_attr_rev[:, 0]       # negate Δη
+            edge_attr_rev[:, 1] = -edge_attr_rev[:, 1]       # sin(-Δφ) = -sin(Δφ)
+            # edge_attr_rev[:, 2] stays same (cos(-Δφ) = cos(Δφ))
+            # edge_attr_rev[:, 3] stays same (ΔR same for reverse)
+            # edge_attr_rev[:, 4] stays same (same_layer flag symmetric)
+            
+            # Interleave: original then reverse for each edge
+            # pairs_mp is [orig_0, rev_0, orig_1, rev_1, ...] (depends on to_undirected ordering)
+            # to_undirected in PyG does: [all_original, all_reverse]
+            # So we concatenate
+            edge_attr_full = np.concatenate([edge_attr, edge_attr_rev], axis=0)
+        else:
+            edge_attr_full = edge_attr
+        
+        return torch.from_numpy(edge_attr_full)
 
     def _load_chunk(self, chunk_idx):
         """
@@ -1203,7 +1311,9 @@ class MultiClassBatchGenerator(IterableDataset):
             out_labels = torch.as_tensor(
                 self._labels[event_idx],
                 dtype=torch.long
-            ).unsqueeze(1)
+            )
+            if out_labels.dim() == 1:
+                out_labels = out_labels.unsqueeze(1)
 
             if torch.cuda.is_available():
                 out_labels = out_labels.pin_memory()
@@ -1215,20 +1325,19 @@ class MultiClassBatchGenerator(IterableDataset):
                 else None
             )
 
-            # Each sample consists of:
-            #   - node features
-            #   - graph edges used for message passing
-            #   - output edges for prediction
-            #   - labels
-            #   - placeholder (unused)
-            #   - optional cluster information
+            # ---- BUGFIX #6: Compute edge features ----
+            edge_attr = self._compute_edge_features(event_idx)
+            if edge_attr is not None and torch.cuda.is_available():
+                edge_attr = edge_attr.pin_memory()
+            
             chunk_samples.append((
                 x_scaled,
-                self.pairs_t,
-                self.pairs_t.clone(),
+                self.pairs_mp,      # ← Bidirectional for message passing
+                self.pairs_pred,    # ← Original directional for prediction
                 out_labels,
-                None,
-                cluster_info
+                edge_attr,          # ← NEW: edge features (was None)
+                cluster_info,
+                event_idx
             ))
 
         return chunk_samples
@@ -1283,17 +1392,18 @@ class MultiClassBatchGenerator(IterableDataset):
     def collate_data(batch):
         """
         Custom DataLoader collation function.
-
-        Combines a list of graph samples into batched lists of node features,
-        edge indices, and concatenated edge labels.
+        
+        Batch elements are 7-tuples:
+            (x, pairs_mp, pairs_pred, labels, edge_attr, cluster_info, event_idx)
         """
         return (
-            [b[0] for b in batch],                    # Node features
-            [b[1] for b in batch],                    # Message-passing edges
-            [b[2] for b in batch],                    # Output edges
-            torch.cat([b[3] for b in batch], dim=0),  # Edge labels
-            None,
-            None
+            [b[0] for b in batch],                    # 0: Node features
+            [b[1] for b in batch],                    # 1: Message-passing edges
+            [b[2] for b in batch],                    # 2: Output edges
+            torch.cat([b[3] for b in batch], dim=0),  # 3: Edge labels
+            [b[4] for b in batch] if batch[0][4] is not None else None,  # 4: Edge features
+            [b[5] for b in batch],                    # 5: Cluster info (list of dicts or Nones)
+            [b[6] for b in batch],                    # 6: Event indices
         )
 
 # ============================================================================
@@ -1311,21 +1421,21 @@ def pretrain_epoch(model, loader, optimizer, criterion, masking_fn,
     
     optimizer.zero_grad(set_to_none=True)
     
+    # Determine if autocast should be enabled
+    use_amp = scaler is not None
+    
     for batch_idx, batch in enumerate(loader):
-        x_list, ei_list, eio_list, _, event_ids, _ = batch
+        x_list, ei_list, eio_list, _, edge_attr_list, _, event_ids = batch
         
         # Apply masking to each graph in the batch
         masked_x_list = []
         mask_list = []
         targets_list = []
         
-        for i, (x, event_id) in enumerate(zip(x_list, event_ids if event_ids else [None]*len(x_list))):
+        for i, x in enumerate(x_list):
             if masking_fn:
-                masked_x, mask, targets = masking_fn.apply_mask(
-                    x, 
-                    event_id=event_id.item() if event_id is not None else None,
-                    feature_names=feature_names
-                )
+                event_id = event_ids[i] if event_ids else None
+                masked_x, mask, targets = masking_fn.apply_mask(x, event_id=event_id, feature_names=feature_names)
                 masked_x_list.append(masked_x)
                 mask_list.append(mask)
                 targets_list.append(targets)
@@ -1338,18 +1448,20 @@ def pretrain_epoch(model, loader, optimizer, criterion, masking_fn,
         mask_list = [m.to(device, non_blocking=True) for m in mask_list]
         targets_list = [t.to(device, non_blocking=True) for t in targets_list]
         
-        # Forward pass
-        predictions = model(masked_x_list, ei_list, eio_list)
-        
-        # Compute reconstruction loss
-        loss = 0
-        for pred, target, mask in zip([predictions], targets_list, mask_list):
-            loss += criterion(pred, target, mask)
-        loss /= len(masked_x_list)
+        # ---- BUGFIX: Wrap forward pass in autocast for actual FP16 ----
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
+            predictions = model(masked_x_list, ei_list, eio_list, edge_attr_list=edge_attr_list)
+            
+            # Compute reconstruction loss
+            loss = 0
+            for pred, target, mask in zip([predictions], targets_list, mask_list):
+                loss += criterion(pred, target, mask)
+            loss /= len(masked_x_list)
         
         # Backward pass with mixed precision
         if scaler:
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -1358,7 +1470,7 @@ def pretrain_epoch(model, loader, optimizer, criterion, masking_fn,
             
         optimizer.zero_grad(set_to_none=True)
         
-        total_loss += loss.item()
+        total_loss += loss.float().item()
         total_masked += sum(m.sum().item() for m in mask_list)
         
         if debug and batch_idx >= 2:
@@ -1386,9 +1498,12 @@ def train_epoch(model, loader, optimizer, criterion, scaler,
     # Reset gradients before starting the epoch.
     optimizer.zero_grad(set_to_none=True)
 
+    # Determine if autocast should be enabled
+    use_amp = scaler is not None
+
     for batch_idx, batch in enumerate(loader):
 
-        x_list, ei_list, eio_list, y_batch, _, _ = batch
+        x_list, ei_list, eio_list, y_batch, edge_attr_list, _, _ = batch
 
         # Move graph data and labels to GPU/target device.
         x_list = [x.to(device, non_blocking=True) for x in x_list]
@@ -1396,11 +1511,11 @@ def train_epoch(model, loader, optimizer, criterion, scaler,
         eio_list = [e.to(device, non_blocking=True) for e in eio_list]
         y_batch = y_batch.to(device, non_blocking=True).squeeze(1)
 
-        # Forward pass
-        scores = model(x_list, ei_list, eio_list)
-
-        # Scale the loss when using gradient accumulation.
-        loss = criterion(scores, y_batch).float() / accumulation_steps
+        # ---- BUGFIX: Wrap forward pass in autocast for actual FP16 ----
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
+            scores = model(x_list, ei_list, eio_list, edge_attr_list=edge_attr_list)
+            # Scale the loss when using gradient accumulation.
+            loss = criterion(scores, y_batch) / accumulation_steps
 
         # Backward pass
         if scaler:
@@ -1427,9 +1542,11 @@ def train_epoch(model, loader, optimizer, criterion, scaler,
 
         # Multiply back by accumulation_steps because the loss was
         # divided earlier for gradient accumulation.
-        total_loss += loss.item() * len(y_batch) * accumulation_steps
+        # Use .float() to ensure loss is in FP32 for logging.
+        total_loss += loss.float().item() * len(y_batch) * accumulation_steps
 
         # Convert logits into predicted class labels.
+        # scores is FP16 when using autocast, but argmax works fine.
         preds = scores.argmax(dim=1)
 
         correct += (preds == y_batch).sum().item()
@@ -1562,67 +1679,36 @@ def compute_metrics_from_numpy(
 
 def evaluate(model, loader, criterion, device,
              use_amp=False, num_classes=5):
-    """
-    Evaluate the model on a validation or test dataset.
-
-    Predictions are accumulated and all metrics are computed at the end
-    using a vectorized confusion matrix.
-    """
     model.eval()
-
     total_loss = 0.0
     total = 0
-
-    # Store predictions for metric computation.
     all_labels = []
     all_preds = []
 
     with torch.no_grad():
-        for x_list, ei_list, eio_list, y_batch, _, _ in loader:
+        for x_list, ei_list, eio_list, y_batch, edge_attr_list, _, _ in loader:  # ← FIXED
 
-            # Move the batch to the target device.
             x_list = [x.to(device, non_blocking=True) for x in x_list]
             ei_list = [e.to(device, non_blocking=True) for e in ei_list]
             eio_list = [e.to(device, non_blocking=True) for e in eio_list]
             y_batch = y_batch.to(device, non_blocking=True).squeeze(1)
 
-            # Forward pass.
-            scores = model(x_list, ei_list, eio_list)
+            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
+                scores = model(x_list, ei_list, eio_list, edge_attr_list=edge_attr_list)
 
-            # Accumulate the total loss.
             total_loss += (
-                criterion(scores, y_batch).float().item()
+                criterion(scores.float(), y_batch).item()
                 * len(y_batch)
             )
 
-            # Convert logits into predicted class labels.
             preds = scores.argmax(dim=1)
-
-            # Store predictions on the CPU for metric computation.
             all_labels.append(y_batch.cpu().numpy())
             all_preds.append(preds.cpu().numpy())
-
             total += len(y_batch)
 
-    # Merge all batches into contiguous arrays.
-    y_true = (
-        np.concatenate(all_labels)
-        if all_labels else np.array([], dtype=np.int64)
-    )
-
-    y_pred = (
-        np.concatenate(all_preds)
-        if all_preds else np.array([], dtype=np.int64)
-    )
-
-    # Compute all evaluation metrics.
-    return compute_metrics_from_numpy(
-        y_true,
-        y_pred,
-        total_loss,
-        total,
-        num_classes
-    )
+    y_true = np.concatenate(all_labels) if all_labels else np.array([], dtype=np.int64)
+    y_pred = np.concatenate(all_preds) if all_preds else np.array([], dtype=np.int64)
+    return compute_metrics_from_numpy(y_true, y_pred, total_loss, total, num_classes)
 
 # ============================================================================
 # BATCHED INFERENCE
@@ -1683,26 +1769,22 @@ def run_inference(model, generator, device, criterion=None, num_classes=5,
         iterator = enumerate(generator)
 
     # Main inference loop
-    for i, (
-        x_scaled,
-        edge_index,
-        edge_index_out,
-        y,
-        _,
-        cluster_info
-    ) in iterator:
+    for i, (x_scaled, edge_index, edge_index_out, y, edge_attr, cluster_info, _event_idx) in iterator:
 
         # Move graph data to the target device.
         x_scaled = x_scaled.to(device, non_blocking=True)
         edge_index = edge_index.to(device, non_blocking=True)
         edge_index_out = edge_index_out.to(device, non_blocking=True)
+        if edge_attr is not None:
+            edge_attr = edge_attr.to(device, non_blocking=True)
 
         # Run the GNN.
         # Lists are used because the model supports batched graphs.
         out = model(
             [x_scaled],
             [edge_index],
-            [edge_index_out]
+            [edge_index_out],
+            edge_attr_list=[edge_attr] if edge_attr is not None else None
         )
 
         # Convert logits into predictions and probabilities.
@@ -2037,7 +2119,7 @@ def save_results_to_parquet(results, save_path, model_name,
 # ============================================================================
 
 def train_model_full(model, train_loader, test_loader, test_generator, optimizer, criterion, scaler,
-                     device, args, model_name, cluster_info=None, tracker=None):
+                     device, args, model_name, cluster_info=None, tracker=None, scheduler=None):
     """
     Complete training pipeline.
 
@@ -2087,6 +2169,8 @@ def train_model_full(model, train_loader, test_loader, test_generator, optimizer
     for epoch in range(start_epoch, args.epochs+1):
         t0 = time.perf_counter()
         train_res = train_epoch(model, train_loader, optimizer, criterion, scaler, device, args.debug, epoch=epoch)
+        if scheduler is not None:
+            scheduler.step()
         test_res = evaluate(model, test_loader, criterion, device)
         dt = time.perf_counter()-t0
         
@@ -2214,7 +2298,8 @@ def train_single_model(args, model_type=None, tracker=None):
                       'unscaled_data_dict': None, 'cluster_info_dict': cluster_info,
                       'debug': args.debug, 'is_bi_directional': True,
                       'train_ratio': 0.0,  # all events go to test
-                      'chunk_size': 2000, 'inference_only': True}
+                      'chunk_size': 2000, 'inference_only': True,
+                      'cells_array': cells}  # ← BUGFIX #6
         test_generator = MultiClassBatchGenerator(mode='test', **gen_kwargs)
         
         _, test_metrics = run_inference(
@@ -2291,7 +2376,8 @@ def train_single_model(args, model_type=None, tracker=None):
                       'unscaled_data_dict': None, 'cluster_info_dict': cluster_info,
                       'debug': args.debug, 'is_bi_directional': True, 
                       'train_ratio': 1.0,  # Use all data for pretraining
-                      'chunk_size': 2000, 'inference_only': False}
+                      'chunk_size': 2000, 'inference_only': False,
+                      'cells_array': cells}  # ← BUGFIX #6
         pretrain_generator = MultiClassBatchGenerator(mode='train', **gen_kwargs)
         
         pretrain_loader = DataLoader(pretrain_generator, batch_size=args.batch_size,
@@ -2401,15 +2487,30 @@ def train_single_model(args, model_type=None, tracker=None):
         if tracker: tracker.log_measurement("model_created")
     
     # ---- COMMON TRAINING SETUP ----
-    criterion = create_loss_function(args, labels, device)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = torch.amp.GradScaler('cuda') if (args.mixed_precision and args.gpu>=0 and torch.cuda.is_available()) else None
-    log(f"✅ {'FP16' if scaler else 'FP32'}")
+    # Reuse the generator's event list
+    all_event_ids = sorted(features_dict.keys())
+    split_idx = int(len(all_event_ids) * args.train_ratio)
     
+    # Extract only training labels to avoid data leakage
+    train_labels = labels[all_event_ids[:split_idx]].flatten()
+
+    criterion = create_loss_function(args, train_labels, device)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    
+    # ---- BUGFIX #9: Cosine annealing LR with warmup ----
+    from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+    warmup_epochs = min(5, max(1, args.epochs // 6))
+    warmup = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
+    cosine = CosineAnnealingLR(optimizer, T_max=args.epochs - warmup_epochs)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
+    
+    scaler = torch.amp.GradScaler('cuda') if (args.mixed_precision and args.gpu>=0 and torch.cuda.is_available()) else None
+    log(f"✅ {'FP16' if scaler else 'FP32'} | LR: cosine+{warmup_epochs}ep warmup")
     gen_kwargs = {'features_dict': features_dict, 'neighbor_pairs': pairs, 'labels': labels,
                   'unscaled_data_dict': None, 'cluster_info_dict': cluster_info,
                   'debug': args.debug, 'is_bi_directional': True, 'train_ratio': args.train_ratio,
-                  'chunk_size': 2000, 'inference_only': False}
+                  'chunk_size': 2000, 'inference_only': False,
+                  'cells_array': cells}  # ← BUGFIX #6
     train_generator = MultiClassBatchGenerator(mode='train', **gen_kwargs)
     test_generator = MultiClassBatchGenerator(mode='test', **gen_kwargs)
     
@@ -2420,7 +2521,8 @@ def train_single_model(args, model_type=None, tracker=None):
     if tracker: tracker.log_measurement("data_loaders_ready")
     
     metrics, model, model_path = train_model_full(model, train_loader, test_loader, test_generator,
-                                                   optimizer, criterion, scaler, device, args, model_filename, cluster_info, tracker)
+                                                   optimizer, criterion, scaler, device, args, model_filename,
+                                                   cluster_info, tracker, scheduler=scheduler)
     
     log(f"\n{'='*60}\n🏁 TRAINING SUMMARY\n{'='*60}")
     log(f"   Best epoch: {metrics['best_epoch']} | F1_Sum: {metrics['best_f1_sum_score']:.2f} | Accuracy: {metrics['best_accuracy']:.4f}")
