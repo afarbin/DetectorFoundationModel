@@ -1,0 +1,6 @@
+[submodule "genesis_ntuplizers/atlascalontuplemaker"]
+	path = genesis_ntuplizers/atlascalontuplemaker
+	url = https://gitlab.cern.ch/moghazna/atlascalontuplemaker.git
+[submodule "genesis_ntuplizers/calotiming_ntuplizer"]
+	path = genesis_ntuplizers/calotiming_ntuplizer
+	url = https://gitlab.cern.ch/atlas_5d_calorimeter/calotiming_ntuplizer.git
