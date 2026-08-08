@@ -118,13 +118,16 @@ def main():
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--patience", type=int, default=8)
+    ap.add_argument("--loss", choices=["nll", "mae"], default="nll",
+                    help="mae = median-targeting cross-check (sigma untrained)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     cfg = JetRegConfig.parse(args.config)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tag = f"{args.config}_seed{args.seed}"
+    cfg_name = args.config + ("-mae" if args.loss == "mae" else "")
+    tag = f"{cfg_name}_seed{args.seed}"
     os.makedirs(args.out, exist_ok=True)
 
     with open(os.path.join(args.data_dir, "manifest.json")) as fh:
@@ -167,6 +170,8 @@ def main():
         mu, logv = out[:, 0], out[:, 1].clamp(-8, 8)
         if epoch < args.warmup_epochs:
             per = F.huber_loss(mu, y, delta=0.3, reduction="none")
+        elif args.loss == "mae":
+            per = (y - mu).abs()   # median-targeting; sigma gets no gradient
         else:
             per = 0.5 * (logv + (y - mu) ** 2 / logv.exp())
         return (per * w).sum() / w.sum()
@@ -229,7 +234,7 @@ def main():
 
     from dfm.jetreg.evaluate import prediction_metrics
     metrics = prediction_metrics(pred_path)
-    metrics.update(config=args.config, seed=args.seed, params=n_par,
+    metrics.update(config=cfg_name, seed=args.seed, params=n_par,
                    best_val=float(best), best_epoch=best_ep,
                    train_minutes=(time.perf_counter() - t0) / 60,
                    n_train=len(train), n_val=len(val), n_test=len(test))
