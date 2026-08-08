@@ -156,7 +156,8 @@ def main():
 
     collate = make_collate(cfg, (tmean, tstd, jmean, jstd))
     dl_train = DataLoader(train, batch_size=args.batch, shuffle=True,
-                          collate_fn=collate, num_workers=0)
+                          collate_fn=collate, num_workers=4,
+                          persistent_workers=True, pin_memory=True)
     dl_val = DataLoader(val, batch_size=512, shuffle=False, collate_fn=collate)
     dl_test = DataLoader(test, batch_size=512, shuffle=False, collate_fn=collate)
 

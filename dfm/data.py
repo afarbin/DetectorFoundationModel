@@ -52,11 +52,16 @@ def _single(pattern: str) -> str:
 class CaloGraphAdapter:
     """Cell tokens from a processed foundation-model dataset directory."""
 
-    def __init__(self, dataset_dir: str, snr_min: float = 2.0):
+    def __init__(self, dataset_dir: str, snr_min: float = 2.0,
+                 e_abs_max_mev: Optional[float] = 100e3):
+        """``e_abs_max_mev``: drop cells with |E| above this (default 100 GeV) -
+        the agreed cell-level cut against extreme forward-noise deposits
+        (FCAL pileup noise reaches tens of GeV/cell). None disables."""
         import h5py  # local import: optional dependency
 
         self.dataset_dir = dataset_dir
         self.snr_min = snr_min
+        self.e_abs_max_mev = e_abs_max_mev
         self.cells = np.load(_single(os.path.join(dataset_dir, "cells_*.npy")))
         self.pairs = np.load(_single(os.path.join(dataset_dir, "pairs_*.npy")))
         self.h5_files = sorted(glob.glob(os.path.join(dataset_dir, "events_*.h5")))
@@ -80,6 +85,9 @@ class CaloGraphAdapter:
             snr = self._h5["cell/snr_computed"][i].astype(np.float32)
             clus = self._h5["cell/cell_cluster_index"][i].astype(np.int64)
             keep_np = np.abs(snr) > self.snr_min
+            if self.e_abs_max_mev is not None:
+                e_raw = self._h5["cell/energy_raw"][i].astype(np.float32)
+                keep_np &= np.abs(e_raw) < self.e_abs_max_mev
             keep = torch.from_numpy(keep_np)
             sub_pairs, _ = subset_subgraph(self.pairs_t, keep)
             s = snr[keep_np]
