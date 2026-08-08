@@ -25,20 +25,31 @@ comparisons, in decreasing priority:
 T = ghost-associated tracks, J = reco-jet features, C = cells in a ΔR < 0.4
 cone around the jet axis.
 
-**An honest reframing of C1** (from plan review): on *this* dataset,
-"JC ≈ C" is **not** the expected outcome. J's pt/m are the *calibrated* jet
-quantities — the EMTopo chain injected event-level pileup information
-(ρ, NPV, µ) and used *all* topocluster constituents — while C is the
-5D-thinned subset (E > 0.5 GeV ∧ 2σ; EMB1/EMB3 bias 0.12/0.11 per our
-selection study). J carrying information beyond C is therefore the physics
-prior, and the interesting measurement is the *size of the JC−C gap*: it
-quantifies what the thinning threw away plus what pileup conditioning buys.
-The original hypothesis — "jet features are learned from the constituents" —
-is the expected limit for a *full-cell* dataset (the review's S2/S4), which
-this study cannot reach with 5D data. To partially separate the two effects
-we add **µ (`averageInteractionsPerCrossing`, present in the 5D ntuple) as an
-optional conditioning input**: if JC−C shrinks substantially when µ is added
-to C, the gap was mostly pileup conditioning, not lost constituents.
+**What the C tokens actually contain** (measured on the calo dataset,
+emulating the 5D selection on cells in jets with pT > 20 GeV, clean events):
+the E > 0.5 GeV ∧ 2σ cut retains **74.6% of the jets' clustered energy**
+(energy-weighted; per-jet median 62%, 10th–90th percentile 33–85%, rising
+with jet energy). Per layer, in jets: Tile A/BC 81–86%, EME2 82%,
+EMB2 61%, **EMB1 32%, EMB3 34%**. So the 5D subset carries the *majority*
+of jet energy — what's missing is the 4-2-0 growth/perimeter soft component
+(plus all negative-energy cells, dropped one-sidedly) — and earlier
+count-based language ("EMB1/EMB3 essentially absent") overstated the
+deficit: cell *counts* in those layers are ~0.2–0.3% retained, but energy
+is ~a third.
+
+**The C1 prior, calibrated by those numbers**: J still carries information C
+lacks — the event-level pileup conditioning (ρ, NPV, µ) injected by the
+calibration chain, and the ~25% (jet-dependent, *fluctuating*) soft
+component. The average missing fraction is learnable (a scale correction);
+its jet-by-jet fluctuation is a resolution cost C cannot recover. So a
+JC−C gap is still expected, but modest — and its size is exactly the
+measurement: it quantifies the calibration information in the sub-threshold
+component plus pileup conditioning. To separate the two we add **µ
+(`averageInteractionsPerCrossing`) as an optional conditioning input**: if
+JC−C shrinks substantially when µ is added to C, the gap was mostly pileup
+conditioning, not lost constituents. The original hypothesis — "jet
+features are learned from the constituents" — corresponds to the full-cell
+limit (S2/S4), which 5D data approaches but does not reach.
 
 ## 2. Data pipeline
 
@@ -61,8 +72,15 @@ to C, the gap was mostly pileup conditioning, not lost constituents.
 - Track association: `ghostTrack_idx` (median 18 tracks/jet, 1.9% empty);
   `btagTrack_idx` is empty for 100% of EMTopo jets — dead, do not use.
 - Cells in a ΔR < 0.4 cone: median 20, p90 64, max ~124 — the 5D subset is
-  sparse (E > 0.5 GeV ∧ 2σ cells only; see
-  `analysis/Cell-Selection-Comparison.ipynb`). Token counts are tiny.
+  sparse in *counts* but retains **~75% of jet clustered energy**
+  (energy-weighted; see §1). Token counts are tiny.
+- **Data-quality alert (calo files)**: 40/100 events of `ttbar_100events`
+  and ~1/3 of `ttbar_1000` contain unphysical cell energies (single cells
+  to −127 GeV; cluster sums of ±tens of TeV). `hh_bbtt` is far cleaner
+  (~2%). Every consumer of calo energies (pretraining included) must filter
+  events on sane cluster-energy sums; the retention numbers above use clean
+  events only. Root cause unknown — flagged for separate investigation
+  (also affects existing foundation-model trainings).
 - Jet pT range ~15–370 GeV; all energies GeV. `nConstituents` and
   `averageInteractionsPerCrossing` branches exist (read successfully).
 
@@ -141,7 +159,10 @@ most contamination-sensitive results (label-efficiency curves). Primary
 corpus is therefore **`hh_bbtt_10k_events`** (10k events, 10 shards —
 a *different physics process*, so event disjointness holds by construction,
 and 10× more pretraining events). `ttbar_1000` becomes a secondary variant
-(same-process pretraining) reported with the overlap caveat.
+(same-process pretraining) reported with the overlap caveat. The corruption
+finding (§2.1) reinforces this choice — hh_bbtt is ~2% corrupted vs ~1/3 of
+`ttbar_1000` — and adds a mandatory event-quality filter (sane cluster-energy
+sum) to `pretrain_calo.py` regardless of corpus.
 Implementation note: `CaloGraphAdapter` currently opens only the first
 `events_*.h5` shard — `pretrain_calo.py` extends it to iterate all shards.
 
@@ -257,10 +278,13 @@ results re-entrant (per-run JSON; `evaluate.py` aggregates whatever exists).
 
 ## 8. Risks & honest caveats
 
-1. **The 5D cell subset is biased** (measured: E > 0.5 GeV ∧ 2σ; EMB1/EMB3
-   bias 0.12/0.11 vs topocluster coverage). Cells-only calibration is a
-   *lower bound* on full-cell performance — and the C1 reframing (§1) makes
-   this quantitative rather than a disclaimer.
+1. **The 5D cell subset truncates the soft component**: ~75% of jet
+   clustered energy retained on average (§1), but with large jet-to-jet
+   spread (33–85%, 10th–90th pct) — the fluctuating part is an
+   irreducible resolution cost for cells-only models, so C results are a
+   *lower bound* on full-cell performance. The per-layer energy losses
+   (EMB1/EMB3 ~⅔ lost, Tile ~15% lost) are now measured, not inferred from
+   counts.
 2. **Truth-match purity** rests on the recomputed ΔR + pt_true cuts; gate:
    B0 response must tighten to a sane core after cuts, else stop and
    investigate matching before training.
