@@ -1,6 +1,6 @@
 # Jet Energy Regression Study — Design & Plan
 
-*Target: per-jet log response `y = ln(E_true/E_reco)` for light jets from the 5D
+*Target: per-jet log pT response `y = ln(pt_true/pt_reco)` for light jets from the 5D
 ntuples, comparing input modalities (tracks / jet features / cells), cell
 encodings (neighbor-graph vs set), and calo-dataset pretraining. Status:
 **plan for review — no training has been run.** Branch tagged `dfm-merge-v0`
@@ -94,7 +94,7 @@ One sample = one matched **light** jet:
 
 | Field | Content | Source |
 |---|---|---|
-| `y` | `ln(E_true/E_reco)`; E from (pt, η, m): `E² = (pt·coshη)² + m²` | matchedTruth vs reco branches |
+| `y` | `ln(pt_true/pt_reco)` = −ln(`response` branch) **[D2]**; truth/reco E stored in meta for later E-based variants | matchedTruth vs reco branches |
 | `jet` (J) | `[η, sinφ, cosφ, log pt, log m, log(1+nConstituents)]` | reco jet branches |
 | `mu` | `averageInteractionsPerCrossing` (optional conditioning, §1) | event branch |
 | `tracks` (T) | ghost-associated tracks × 18 features (`dfm.data.TRACK_FEATURES`) | `ghostTrack_idx` → `Track_*` |
@@ -139,10 +139,14 @@ Output: sharded `.npz` (one per input file) + `manifest.json`, written to
   pt cut alone cannot), `|η_reco| < 2.5`.
 - Duplicate-truth guard: two reco jets carrying identical matchedTruth
   4-vectors (both matched to the same truth jet) are both dropped.
-- Isolation, **both sides** (builder flags, default on): no other reco jet
-  with pt > 15 GeV within ΔR < 0.8 of the jet, and no *other* jet's truth
-  match within ΔR < 1.0 of this jet's truth axis (truth-side overlap makes
-  E_true itself ambiguous — a label bias, not an input effect).
+- Isolation is a **stored flag, not a cut [D1]**: `iso_reco` (no other reco
+  jet pt > 15 GeV within ΔR < 0.8) and `iso_truth` (no other jet's truth
+  match within ΔR < 1.0 of this jet's truth axis). **Training uses isolated
+  jets; evaluation reports isolated and non-isolated populations
+  separately** — the non-isolated gap measures cell energy sharing between
+  overlapping clusters, and is the motivation for the event-level Stage-2
+  follow-up ("full event graph propagation should help the non-isolated
+  jets").
 - Splits **by file** (train = files 11+12, val = 13, test = 14; ~150k train
   jets before isolation): normalization, reweighting, and all model
   selection touch train files only.
@@ -159,11 +163,12 @@ smoke test). Set-encoding variant: same pretext with `local="none"`.
 (`processed_data/ttbar_1000`) has an unverifiable event overlap with the 5D
 ttbar files: EventNumber is unfilled in the Calo ntuples (a known ntuplizer
 gap), so disjointness cannot be demonstrated, which would taint exactly the
-most contamination-sensitive results (label-efficiency curves). Primary
-corpus is therefore **`hh_bbtt_10k_events`** (10k events, 10 shards —
-a *different physics process*, so event disjointness holds by construction,
-and 10× more pretraining events). `ttbar_1000` becomes a secondary variant
-(same-process pretraining) reported with the overlap caveat. Both corpora
+most contamination-sensitive results (label-efficiency curves). **Decision [D5]: `ttbar_1000` is the pretraining corpus** (same-process,
+smallest domain shift to the 5D ttbar jets). The overlap caveat therefore
+*stands* and is attached verbatim to any label-efficiency result:
+EventNumber is unfilled in the Calo ntuples, so pretrain/finetune event
+disjointness cannot be verified. `hh_bbtt` (disjoint by construction) is
+kept as an optional cross-check corpus. Both corpora
 get the §2.1 **cell energy cut** in `pretrain_calo.py` (the two-sided S3
 masking subset would otherwise include the deep-negative forward noise
 cells; the different negative-sum rates — ~2% hh_bbtt vs ~40% ttbar —
@@ -231,16 +236,15 @@ jet features (J) ─ MLP embed ─┤ (concat when J enabled; µ optionally appe
 
 Per (pT_true, η) bin, on the test file:
 
-- **JES / closure**: median response `E_corr/E_true` after correction, vs
+- **JES / closure**: median pT response `pt_corr/pt_true` after correction, vs
   pT_true *and* vs pT_reco. Acceptance target: |non-closure| ≲ 1–2% in the
   bulk (20–250 GeV); edge bins reported but not gated (resolution migration
   at the 15–25 GeV spectrum edge is expected even with flat weights).
 - **JER**: robust width **IQR/1.349** (Gaussian-equivalent σ) of the
   response per bin — chosen over IQR/2 so any later NSC-style fit
   (`σ/E = N/E ⊕ S/√E ⊕ C`, stretch goal) is in conventional units.
-- **Baselines**: (B0) the ntuple's calibrated jets — recomputed as an
-  **E-response** with exactly the target's 4-vector construction and cuts
-  (the `response` branch is a pT-response; kept only as a cross-check);
+- **Baselines**: (B0) the ntuple's calibrated jets — the `response` branch
+  after the §2.3 cuts (a pT response, matching the D2 target directly);
   (B1) global median correction; (B2) J-only model (a learned pT/η
   recalibration — the floor any C/T model must beat to claim constituent
   information matters).
@@ -267,7 +271,7 @@ once.
 | File | Role |
 |---|---|
 | `build_dataset.py` | 5D files → per-jet shards (§2.2–2.3), incl. cell matching, subgraph extraction, QA stats |
-| `pretrain_calo.py` | masked pretraining on hh_bbtt (primary) / ttbar_1000 (variant), all shards → transferable encoder checkpoints (graph + set) |
+| `pretrain_calo.py` | masked pretraining on ttbar_1000 [D5] (hh_bbtt optional cross-check), all shards → transferable encoder checkpoints (graph + set) |
 | `model.py` | config-driven assembly (inputs, encoding, µ conditioning, pretrained init, freeze) |
 | `train.py` | one run: config in → checkpoint + per-jet test predictions + metrics JSON |
 | `evaluate.py` | closure/resolution/pull plots, domain-shift check, comparison tables across runs |
@@ -306,17 +310,15 @@ results re-entrant (per-run JSON; `evaluate.py` aggregates whatever exists).
    and any transfer claim to other samples needs a different-process test
    set (future: hh_bbtt jets, once cells+tracks exist for the same events).
 
-## 9. What happens next (after your review)
+## 9. Decisions (resolved with Amir, 2026-08-08)
 
-Decision points where your input changes the work:
-
-- **D1**: cuts — pt_true > 20 GeV, ΔR < 0.3, isolation 0.8/1.0 (reco/truth)?
-- **D2**: regress E-response (plan) or pT-response?
-- **D3**: matrix scope — all tiers, or Tier 0+1 first with a checkpoint
-  review before Tier 2+?
-- **D4**: files — 4 of 17 (plan), or more?
-- **D5**: pretraining corpus — hh_bbtt primary (plan, disjointness by
-  construction) vs ttbar_1000 (same-process, unverifiable overlap)?
-
-On approval: implement `dfm/jetreg/` + the batched NeighborConv, build the
-dataset, run Tier 0, gate on the §8.2 sanity check, then Tier 1 and report.
+- **D1**: isolation = stored flags (`iso_reco`, `iso_truth`); train on
+  isolated jets, evaluate both populations separately (the gap measures
+  inter-cluster energy sharing; Stage-2 event-level is the follow-up).
+- **D2**: regress the **pT response**, `y = ln(pt_true/pt_reco)`.
+- **D3**: **gated execution** — build dataset, run Tier 0 (QA + baselines,
+  sanity gate on the B0 response) and Tier 1, review together before
+  Tier 2+.
+- **D4**: 4 files (11+12 train / 13 val / 14 test).
+- **D5**: pretraining corpus = `ttbar_1000` (overlap caveat attached to
+  label-efficiency claims); `hh_bbtt` optional cross-check.
