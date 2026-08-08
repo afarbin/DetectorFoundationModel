@@ -27,10 +27,10 @@ cone around the jet axis.
 
 **What the C tokens actually contain** (measured on the calo dataset,
 emulating the 5D selection on cells in jets with pT > 20 GeV, clean events):
-the E > 0.5 GeV ∧ 2σ cut retains **74.6% of the jets' clustered energy**
-(energy-weighted; per-jet median 62%, 10th–90th percentile 33–85%, rising
+the E > 0.5 GeV ∧ 2σ cut retains **75.0% of the jets' clustered energy**
+(energy-weighted, all 100 events; per-jet median 63%, 10th–90th percentile 32–85%, rising
 with jet energy). Per layer, in jets: Tile A/BC 81–86%, EME2 82%,
-EMB2 61%, **EMB1 32%, EMB3 34%**. So the 5D subset carries the *majority*
+EMB2 64%, **EMB1 33%, EMB3 33%**. So the 5D subset carries the *majority*
 of jet energy — what's missing is the 4-2-0 growth/perimeter soft component
 (plus all negative-energy cells, dropped one-sidedly) — and earlier
 count-based language ("EMB1/EMB3 essentially absent") overstated the
@@ -74,13 +74,17 @@ limit (S2/S4), which 5D data approaches but does not reach.
 - Cells in a ΔR < 0.4 cone: median 20, p90 64, max ~124 — the 5D subset is
   sparse in *counts* but retains **~75% of jet clustered energy**
   (energy-weighted; see §1). Token counts are tiny.
-- **Data-quality alert (calo files)**: 40/100 events of `ttbar_100events`
-  and ~1/3 of `ttbar_1000` contain unphysical cell energies (single cells
-  to −127 GeV; cluster sums of ±tens of TeV). `hh_bbtt` is far cleaner
-  (~2%). Every consumer of calo energies (pretraining included) must filter
-  events on sane cluster-energy sums; the retention numbers above use clean
-  events only. Root cause unknown — flagged for separate investigation
-  (also affects existing foundation-model trainings).
+- **Noisy forward cells (calo files) — understood, handled by a cell cut**:
+  ~40% of ttbar calo events show large negative deposits (single cells to
+  −127 GeV) and even negative event-level cluster-energy sums. These are
+  *not* corruption: the extreme cells sit at only 5–7σ of their own noise
+  (FCAL0/EME2/HEC pileup noise reaches tens of GeV per cell), the negative
+  aggregate is consistent with out-of-time-pileup undershoot, and the cells
+  recur randomly (not hot channels). Jet cones are central and unaffected —
+  the retention numbers above are computed over **all** 100 events and are
+  stable (75.0% vs 74.6% with event vetoes). Policy: a simple **cell energy
+  cut** in the pretraining pipeline (drop extreme-|E| / deep-negative
+  cells; threshold fixed at implementation) rather than event filtering.
 - Jet pT range ~15–370 GeV; all energies GeV. `nConstituents` and
   `averageInteractionsPerCrossing` branches exist (read successfully).
 
@@ -159,10 +163,11 @@ most contamination-sensitive results (label-efficiency curves). Primary
 corpus is therefore **`hh_bbtt_10k_events`** (10k events, 10 shards —
 a *different physics process*, so event disjointness holds by construction,
 and 10× more pretraining events). `ttbar_1000` becomes a secondary variant
-(same-process pretraining) reported with the overlap caveat. The corruption
-finding (§2.1) reinforces this choice — hh_bbtt is ~2% corrupted vs ~1/3 of
-`ttbar_1000` — and adds a mandatory event-quality filter (sane cluster-energy
-sum) to `pretrain_calo.py` regardless of corpus.
+(same-process pretraining) reported with the overlap caveat. Both corpora
+get the §2.1 **cell energy cut** in `pretrain_calo.py` (the two-sided S3
+masking subset would otherwise include the deep-negative forward noise
+cells; the different negative-sum rates — ~2% hh_bbtt vs ~40% ttbar —
+presumably reflect pileup conditions, not data quality).
 Implementation note: `CaloGraphAdapter` currently opens only the first
 `events_*.h5` shard — `pretrain_calo.py` extends it to iterate all shards.
 
