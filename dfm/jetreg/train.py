@@ -14,6 +14,7 @@ import time
 
 import numpy as np
 import torch
+import torch.multiprocessing
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
@@ -108,6 +109,9 @@ def flat_pt_weights(pt_true_train, pt_true):
 
 
 def main():
+    # many concurrent jobs x persistent workers exhaust the default
+    # file_descriptor sharing strategy ("received 0 items of ancdata")
+    torch.multiprocessing.set_sharing_strategy("file_system")
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--out", required=True)
