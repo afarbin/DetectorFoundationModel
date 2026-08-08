@@ -234,7 +234,9 @@ jet features (J) ─ MLP embed ─┤ (concat when J enabled; µ optionally appe
 
 ## 5. Metrics & baselines
 
-Per (pT_true, η) bin, on the test file:
+On the test file, profiled in **pT_true, |η| (with the 1.37–1.52 crack as
+its own bin), and φ** — JES and JER as functions of each; φ should be flat
+in MC, so the φ profile doubles as a closure sanity check:
 
 - **JES / closure**: median pT response `pt_corr/pt_true` after correction, vs
   pT_true *and* vs pT_reco. Acceptance target: |non-closure| ≲ 1–2% in the

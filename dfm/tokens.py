@@ -74,7 +74,8 @@ def pad_token_list(per_event: Sequence[Tensor], modality: str,
                    group_ids: Optional[Sequence[Tensor]] = None) -> TokenBatch:
     """Pad a list of per-event ``[n_i, F]`` feature tensors into a TokenBatch."""
     b = len(per_event)
-    n_max = max(int(t.shape[0]) for t in per_event)
+    # at least one (masked-out) slot so empty modalities stay shape-safe
+    n_max = max(1, max(int(t.shape[0]) for t in per_event))
     f = int(per_event[0].shape[1])
     features = per_event[0].new_zeros((b, n_max, f))
     mask = torch.zeros((b, n_max), dtype=torch.bool)

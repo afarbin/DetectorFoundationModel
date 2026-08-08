@@ -168,7 +168,12 @@ class NeighborConv(nn.Module):
 
 
 class NeighborConvBlock(nn.Module):
-    """Residual (LayerNorm -> NeighborConv -> GELU) applied per event."""
+    """Residual (LayerNorm -> NeighborConv -> GELU) over per-event edge lists.
+
+    Batched: all events' valid tokens are flattened once and the conv runs on
+    a single block-diagonal edge index (per-event edges shifted by token
+    offsets), so cost does not scale with batch size in Python.
+    """
 
     def __init__(self, dim: int):
         super().__init__()
@@ -176,11 +181,17 @@ class NeighborConvBlock(nn.Module):
         self.conv = NeighborConv(dim, dim)
 
     def forward(self, x: Tensor, mask: Tensor, edges: List[Tensor]) -> Tensor:
+        b, n_max, d = x.shape
+        counts = mask.sum(dim=1)                      # valid tokens per event
+        flat = x[mask]                                # [N_total, D]
+        if flat.shape[0] == 0:
+            return x
+        offsets = torch.cumsum(counts, dim=0) - counts
+        shifted = [e + offsets[i] for i, e in enumerate(edges) if e.numel()]
+        if not shifted:
+            return x
+        big = torch.cat(shifted, dim=0)               # [E_total, 2]
+        h = F.gelu(self.conv(self.norm(flat), big))
         out = x.clone()
-        for i in range(x.shape[0]):
-            n = int(mask[i].sum())
-            if n == 0 or edges[i].numel() == 0:
-                continue
-            h = F.gelu(self.conv(self.norm(x[i, :n]), edges[i]))
-            out[i, :n] = x[i, :n] + h
+        out[mask] = flat + h
         return out
