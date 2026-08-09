@@ -67,8 +67,10 @@ class CaloGraphAdapter:
         self.h5_files = sorted(glob.glob(os.path.join(dataset_dir, "events_*.h5")))
         if not self.h5_files:
             raise FileNotFoundError(f"no events_*.h5 under {dataset_dir}")
-        self._h5 = h5py.File(self.h5_files[0], "r")
-        self.num_events = int(self._h5["cell/snr_computed"].shape[0])
+        self._h5s = [h5py.File(f, "r") for f in self.h5_files]
+        self._counts = [int(h["cell/snr_computed"].shape[0]) for h in self._h5s]
+        self._offsets = np.cumsum([0] + self._counts)
+        self.num_events = int(self._offsets[-1])
         self.eta = self.cells["eta_event0"].astype(np.float32)
         self.phi = self.cells["phi_event0"].astype(np.float32)
         self.pairs_t = torch.from_numpy(self.pairs.astype(np.int64))
@@ -78,15 +80,20 @@ class CaloGraphAdapter:
 
         Cells with ``|SNR| > snr_min`` are kept (S3 subset); the neighbor
         subgraph is restricted and reindexed per event. Extras carry the
-        per-event edge lists' 5-class and binary labels.
+        per-event edge lists' 5-class and binary labels. Event indices span
+        ALL ``events_*.h5`` shards of the dataset dir, concatenated in sorted
+        order.
         """
         feats, gids, edge_lists, labels5, labels_bin = [], [], [], [], []
         for i in indices:
-            snr = self._h5["cell/snr_computed"][i].astype(np.float32)
-            clus = self._h5["cell/cell_cluster_index"][i].astype(np.int64)
+            sh = int(np.searchsorted(self._offsets, i, side="right") - 1)
+            row = int(i - self._offsets[sh])
+            h5 = self._h5s[sh]
+            snr = h5["cell/snr_computed"][row].astype(np.float32)
+            clus = h5["cell/cell_cluster_index"][row].astype(np.int64)
             keep_np = np.abs(snr) > self.snr_min
             if self.e_abs_max_mev is not None:
-                e_raw = self._h5["cell/energy_raw"][i].astype(np.float32)
+                e_raw = h5["cell/energy_raw"][row].astype(np.float32)
                 keep_np &= np.abs(e_raw) < self.e_abs_max_mev
             keep = torch.from_numpy(keep_np)
             sub_pairs, _ = subset_subgraph(self.pairs_t, keep)

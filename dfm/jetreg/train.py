@@ -124,23 +124,42 @@ def main():
     ap.add_argument("--patience", type=int, default=8)
     ap.add_argument("--loss", choices=["nll", "mae"], default="nll",
                     help="mae = median-targeting cross-check (sigma untrained)")
+    ap.add_argument("--pretrained", default=None,
+                    help="pretrain_calo checkpoint: init the encoder from it")
+    ap.add_argument("--freeze-encoder", action="store_true",
+                    help="linear probe: train only the head")
+    ap.add_argument("--train-frac", type=float, default=1.0,
+                    help="label-efficiency: subsample the train jets")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     cfg = JetRegConfig.parse(args.config)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cfg_name = args.config + ("-mae" if args.loss == "mae" else "")
+    cfg_name = args.config + ("-mae" if args.loss == "mae" else "") \
+        + ("-pre" if args.pretrained else "") \
+        + ("-probe" if args.freeze_encoder else "") \
+        + (f"-f{args.train_frac:g}" if args.train_frac < 1 else "")
     tag = f"{cfg_name}_seed{args.seed}"
     os.makedirs(args.out, exist_ok=True)
 
     with open(os.path.join(args.data_dir, "manifest.json")) as fh:
         manifest = json.load(fh)
     shards = [os.path.join(args.data_dir, f["output"]) for f in manifest["files"]]
-    assert len(shards) >= 4, "expect 4 shards (2 train / 1 val / 1 test)"
-    train = JetShards(shards[:2], iso_only=True)
-    val = JetShards(shards[2:3], iso_only=True)
-    test = JetShards(shards[3:4], iso_only=False)   # both populations (D1)
+    assert len(shards) >= 4, "need at least 4 shards"
+    if len(shards) >= 8:   # full-data mode: last 2 test, 2 before that val
+        tr_s, va_s, te_s = shards[:-4], shards[-4:-2], shards[-2:]
+    else:                  # original 4-file layout
+        tr_s, va_s, te_s = shards[:2], shards[2:3], shards[3:4]
+    train = JetShards(tr_s, iso_only=True)
+    val = JetShards(va_s, iso_only=True)
+    test = JetShards(te_s, iso_only=False)   # both populations (D1)
+    if args.train_frac < 1.0:
+        rng = np.random.default_rng(1000 + args.seed)
+        keep = rng.choice(train.n, max(1, int(args.train_frac * train.n)),
+                          replace=False)
+        train.arrays = {k: v[keep] for k, v in train.arrays.items()}
+        train.n = len(keep)
     print(f"[{tag}] jets: train {len(train)} (iso), val {len(val)} (iso), "
           f"test {len(test)} (all)", flush=True)
 
@@ -166,8 +185,21 @@ def main():
     dl_test = DataLoader(test, batch_size=512, shuffle=False, collate_fn=collate)
 
     model = JetRegModel(cfg).to(dev)
+    if args.pretrained:
+        sd = torch.load(args.pretrained, weights_only=False, map_location=dev)
+        missing, unexpected = model.encoder.load_state_dict(sd["encoder"],
+                                                            strict=False)
+        n_all = len(model.encoder.state_dict())
+        print(f"[{tag}] pretrained init: {n_all - len(missing)}/{n_all} encoder "
+              f"tensors loaded from {os.path.basename(args.pretrained)}", flush=True)
+    if args.freeze_encoder:
+        if model.encoder is None:
+            raise ValueError("--freeze-encoder needs a token modality")
+        for prm in model.encoder.parameters():
+            prm.requires_grad = False
     n_par = sum(p.numel() for p in model.parameters())
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+                            lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=max(args.epochs - args.warmup_epochs, 1), eta_min=1e-5)
 

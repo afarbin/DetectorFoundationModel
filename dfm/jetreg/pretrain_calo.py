@@ -48,13 +48,13 @@ def make_batch(events, idxs):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--calo-dir", required=True)
+    ap.add_argument("--calo-dir", required=True, nargs="+",
+                    help="one or more processed calo dataset dirs; "
+                         "10% of each is held out for validation")
     ap.add_argument("--out", required=True)
     ap.add_argument("--encoding", choices=["graph", "set"], default="graph")
     ap.add_argument("--strategy", default="group")
     ap.add_argument("--mask-ratio", type=float, default=0.15)
-    ap.add_argument("--train-events", type=int, default=640)
-    ap.add_argument("--val-events", type=int, default=160)
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--epochs", type=int, default=25)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -67,11 +67,15 @@ def main():
     tag = f"pretrain_{args.encoding}_{args.strategy}_r{args.mask_ratio}"
     os.makedirs(args.out, exist_ok=True)
 
-    adapter = CaloGraphAdapter(args.calo_dir)   # S3 subset + cell energy cut
     t0 = time.perf_counter()
-    train_ev = preload(adapter, range(args.train_events))
-    val_ev = preload(adapter, range(args.train_events,
-                                    args.train_events + args.val_events))
+    train_ev, val_ev = [], []
+    for d in args.calo_dir:
+        adapter = CaloGraphAdapter(d)   # S3 subset + cell energy cut
+        n = adapter.num_events
+        n_val = max(1, n // 10)
+        train_ev += preload(adapter, range(n - n_val))
+        val_ev += preload(adapter, range(n - n_val, n))
+        print(f"[{tag}] {d}: {n - n_val} train / {n_val} val events", flush=True)
     sizes = [len(e[0]) for e in train_ev]
     print(f"[{tag}] preloaded {len(train_ev)}+{len(val_ev)} events, "
           f"cells/event median {int(np.median(sizes))} "
