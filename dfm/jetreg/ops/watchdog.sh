@@ -18,6 +18,21 @@ while true; do
   if [ -n "$alert" ]; then
     echo "$ts RESOURCE_ALERT $alert" >> $L/alerts.log
   fi
+  # soft throttle: pause newest training below 12GB, resume above 25GB
+  if [ "$ma_gb" -lt 12 ]; then
+    v=$(pgrep -u afarbin -f "dfm.jetreg.train" -n)
+    if [ -n "$v" ] && ! grep -q T "/proc/$v/stat" 2>/dev/null; then
+      kill -STOP "$v" && echo "$ts PAUSED pid=$v (mem_avail=${ma_gb}GB)" >> $L/alerts.log
+    fi
+  elif [ "$ma_gb" -gt 25 ]; then
+    for v in $(pgrep -u afarbin -f "dfm.jetreg.train"); do
+      state=$(awk "{print \$3}" "/proc/$v/stat" 2>/dev/null)
+      if [ "$state" = "T" ]; then
+        kill -CONT "$v" && echo "$ts RESUMED pid=$v (mem_avail=${ma_gb}GB)" >> $L/alerts.log
+        break
+      fi
+    done
+  fi
   # emergency valve: critical memory -> stop newest of MY trainings
   if [ "$ma_gb" -lt 8 ]; then
     victim=$(pgrep -u afarbin -f "dfm.jetreg.train" -n)
