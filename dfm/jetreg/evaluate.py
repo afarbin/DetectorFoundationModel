@@ -81,6 +81,11 @@ def prediction_metrics(pred_path):
     every = np.ones(len(y), bool)
     out = {"all": pop(every), "iso": pop(iso),
            "noniso": pop(~iso) if (~iso).sum() > 50 else None}
+    if "flavor" in z.files:
+        fl = z["flavor"]
+        for name, code in (("light", 0), ("c", 1), ("b", 2)):
+            m = iso & (fl == code)
+            out[f"flav_{name}"] = pop(m) if m.sum() > 200 else None
     # headline scalars = isolated population (the trained-on population)
     for k in ("nll", "mae", "pull_std", "jes_closure_rms", "jer_mid"):
         out[k] = out["iso"][k]

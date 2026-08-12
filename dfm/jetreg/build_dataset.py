@@ -58,7 +58,7 @@ def build_file(path, matcher, id_map, inv_orig_to_compact, pairs_compact,
                ("y", "jet", "mu", "tracks", "cells", "cell_edges", "n_unmapped",
                 "iso_reco", "iso_truth", "pt_true", "pt_reco", "eta_reco", "phi_reco",
                 "response", "event", "n_cells", "n_edges", "n_iso_cells",
-                "n_tracks")}
+                "n_tracks", "flavor")}
     cuts = dict(jets_total=0, matched=0, light=0, pt_true=0, dr=0, eta=0,
                 dup_truth=0, kept=0)
     t0 = time.perf_counter()
@@ -125,7 +125,11 @@ def build_file(path, matcher, id_map, inv_orig_to_compact, pairs_compact,
             cuts["jets_total"] += nj
             matched = tpt > 0
             cuts["matched"] += int(matched.sum())
-            sel = matched & (lab == 0)
+            al = np.abs(lab)
+            if args.flavors == "light":
+                sel = matched & (lab == 0)
+            else:   # b/c/light, tau+other excluded
+                sel = matched & np.isin(al, (0, 4, 5))
             cuts["light"] += int(sel.sum())
             sel &= tpt > args.pt_true_min
             cuts["pt_true"] += int(sel.sum())
@@ -200,6 +204,9 @@ def build_file(path, matcher, id_map, inv_orig_to_compact, pairs_compact,
                 samples["n_edges"].append(len(sub_pairs))
                 samples["n_iso_cells"].append(int((deg == 0).sum()))
                 samples["n_tracks"].append(len(ghost))
+                # flavor: 0=light, 1=c, 2=b
+                samples["flavor"].append(
+                    2 if abs(lab[j]) == 5 else (1 if abs(lab[j]) == 4 else 0))
                 cuts["kept"] += 1
         print(f"  {os.path.basename(path)}: events {hi}/{n_events}, "
               f"jets kept {cuts['kept']}  [{time.perf_counter()-t0:.0f}s]",
@@ -227,6 +234,8 @@ def main():
     ap.add_argument("--cone-dr", type=float, default=0.4)
     ap.add_argument("--chunk", type=int, default=500)
     ap.add_argument("--max-events", type=int, default=None)
+    ap.add_argument("--flavors", choices=["light", "all"], default="all",
+                    help="all = b/c/light with stored label (Phase 2 T1)")
     args = ap.parse_args()
 
     import uproot

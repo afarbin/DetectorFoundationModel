@@ -87,6 +87,9 @@ def make_collate(cfg: JetRegConfig, norm):
         if cfg.mu:
             out["mu"] = torch.tensor(
                 np.array([[it["mu"] / 50.0] for it in items]), dtype=torch.float32)
+        if cfg.flavor_cond:
+            f = np.array([it["flavor"] for it in items])
+            out["flav"] = torch.eye(3)[torch.from_numpy(f).long()]
         return out
 
     return collate
@@ -130,6 +133,8 @@ def main():
                     help="linear probe: train only the head")
     ap.add_argument("--train-frac", type=float, default=1.0,
                     help="label-efficiency: subsample the train jets")
+    ap.add_argument("--flavor-select", choices=["all", "b", "c", "light"],
+                    default="all", help="restrict all splits to one flavor")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -139,7 +144,8 @@ def main():
     cfg_name = args.config + ("-mae" if args.loss == "mae" else "") \
         + ("-pre" if args.pretrained else "") \
         + ("-probe" if args.freeze_encoder else "") \
-        + (f"-f{args.train_frac:g}" if args.train_frac < 1 else "")
+        + (f"-f{args.train_frac:g}" if args.train_frac < 1 else "") \
+        + ({"b": "-b", "c": "-c", "light": "-l"}.get(args.flavor_select, ""))
     tag = f"{cfg_name}_seed{args.seed}"
     os.makedirs(args.out, exist_ok=True)
 
@@ -154,6 +160,12 @@ def main():
     train = JetShards(tr_s, iso_only=True)
     val = JetShards(va_s, iso_only=True)
     test = JetShards(te_s, iso_only=False)   # both populations (D1)
+    if args.flavor_select != "all":
+        want = {"light": 0, "c": 1, "b": 2}[args.flavor_select]
+        for ds in (train, val, test):
+            keep = np.nonzero(ds.arrays["flavor"] == want)[0]
+            ds.arrays = {k: v[keep] for k, v in ds.arrays.items()}
+            ds.n = len(keep)
     if args.train_frac < 1.0:
         rng = np.random.default_rng(1000 + args.seed)
         keep = rng.choice(train.n, max(1, int(args.train_frac * train.n)),
@@ -267,7 +279,8 @@ def main():
         pt_true=test.arrays["pt_true"], pt_reco=test.arrays["pt_reco"],
         eta=test.arrays["eta_reco"], phi=test.arrays["phi_reco"],
         response=test.arrays["response"],
-        iso=(test.arrays["iso_reco"] & test.arrays["iso_truth"]))
+        iso=(test.arrays["iso_reco"] & test.arrays["iso_truth"]),
+        flavor=test.arrays.get("flavor", np.zeros(len(mu), np.int8)))
 
     from dfm.jetreg.evaluate import prediction_metrics
     metrics = prediction_metrics(pred_path)

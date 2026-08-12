@@ -27,6 +27,7 @@ class JetRegConfig:
     tracks: bool = False
     jet: bool = False
     mu: bool = False
+    flavor_cond: bool = False
     dim: int = 128
     local_depth: int = 2
     global_depth: int = 2
@@ -54,7 +55,7 @@ class JetRegConfig:
         if bad:
             raise ValueError(f"unknown inputs {bad} in '{name}'")
         return cls(cells=cells, tracks="T" in core, jet="J" in core,
-                   mu="mu" in opts)
+                   mu="mu" in opts, flavor_cond="fc" in opts)
 
 
 class JetRegModel(nn.Module):
@@ -83,6 +84,8 @@ class JetRegModel(nn.Module):
             head_in += cfg.dim
         if cfg.mu:
             head_in += 1
+        if cfg.flavor_cond:
+            head_in += 3
         if head_in == 0:
             raise ValueError("config enables no inputs at all")
         self.head = nn.Sequential(
@@ -104,4 +107,6 @@ class JetRegModel(nn.Module):
             parts.append(self.jet_embed(batch["jet"]))
         if self.cfg.mu:
             parts.append(batch["mu"])
+        if self.cfg.flavor_cond:
+            parts.append(batch["flav"])
         return self.head(torch.cat(parts, dim=-1))
