@@ -25,6 +25,20 @@ from dfm.jetreg.event_models import METModel, JetFinder, jetfinder_loss, \
 MET_SCALE = 100.0  # GeV
 
 
+OBJ_KEYS = ("tracks", "cells", "cell_edges", "jets", "jet_flavor",
+            "truth_jets")
+
+
+def as_obj(a):
+    """1-D object array of per-event arrays, even if numpy densified it."""
+    if a.dtype == object and a.ndim == 1:
+        return a
+    out = np.empty(len(a), dtype=object)
+    for i in range(len(a)):
+        out[i] = np.asarray(a[i])
+    return out
+
+
 class EventShards(Dataset):
     def __init__(self, paths):
         self.data = []
@@ -32,7 +46,8 @@ class EventShards(Dataset):
         for p in paths:
             z = np.load(p, allow_pickle=True)
             keys = [k for k in z.files]
-            self.data.append({k: z[k] for k in keys})
+            self.data.append({k: (as_obj(z[k]) if k in OBJ_KEYS else z[k])
+                              for k in keys})
         self.arrays = {k: np.concatenate([d[k] for d in self.data])
                        for k in keys}
         self.n = len(self.arrays["met_true"])

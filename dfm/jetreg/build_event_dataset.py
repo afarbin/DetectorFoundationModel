@@ -143,7 +143,12 @@ def build_file(path, matcher, id_map, inv, pairs_compact, n_compact, args, out):
             S["event"].append(int(e["eventNumber"]))
         print(f"  {os.path.basename(path)}: {hi}/{n_events} "
               f"[{time.perf_counter()-t0:.0f}s]", flush=True)
-    obj = {k: (np.array(v, dtype=object)
+    def obj_array(v):   # 1-D object array even when shapes are uniform
+        a = np.empty(len(v), dtype=object)
+        for i, x in enumerate(v):
+            a[i] = x
+        return a
+    obj = {k: (obj_array(v)
                if k in ("tracks", "cells", "cell_edges", "jets", "jet_flavor",
                         "truth_jets") else np.array(v))
            for k, v in S.items()}
