@@ -28,6 +28,7 @@ class JetRegConfig:
     jet: bool = False
     mu: bool = False
     flavor_cond: bool = False
+    panoptic: bool = False
     dim: int = 128
     local_depth: int = 2
     global_depth: int = 2
@@ -55,7 +56,8 @@ class JetRegConfig:
         if bad:
             raise ValueError(f"unknown inputs {bad} in '{name}'")
         return cls(cells=cells, tracks="T" in core, jet="J" in core,
-                   mu="mu" in opts, flavor_cond="fc" in opts)
+                   mu="mu" in opts, flavor_cond="fc" in opts,
+                   panoptic="pan" in opts)
 
 
 class JetRegModel(nn.Module):
@@ -88,9 +90,10 @@ class JetRegModel(nn.Module):
             head_in += 3
         if head_in == 0:
             raise ValueError("config enables no inputs at all")
+        out_dim = 5 if cfg.panoptic else 2   # [p_b,p_c,p_l logits, mu, logvar]
         self.head = nn.Sequential(
             nn.LayerNorm(head_in), nn.Linear(head_in, cfg.dim), nn.GELU(),
-            nn.Linear(cfg.dim, cfg.dim), nn.GELU(), nn.Linear(cfg.dim, 2))
+            nn.Linear(cfg.dim, cfg.dim), nn.GELU(), nn.Linear(cfg.dim, out_dim))
 
     def forward(self, batch: Dict) -> torch.Tensor:
         """batch: {'cells': TokenBatch?, 'tracks': TokenBatch?,

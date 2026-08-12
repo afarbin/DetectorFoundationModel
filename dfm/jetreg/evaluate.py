@@ -86,6 +86,18 @@ def prediction_metrics(pred_path):
         for name, code in (("light", 0), ("c", 1), ("b", 2)):
             m = iso & (fl == code)
             out[f"flav_{name}"] = pop(m) if m.sum() > 200 else None
+    if "probs" in z.files and "flavor" in z.files:
+        from sklearn.metrics import roc_auc_score
+        pb = z["probs"][:, 2][iso]
+        fli = z["flavor"][iso]
+        is_b = fli == 2
+        tag = {"auc_b": float(roc_auc_score(is_b, pb))}
+        for wp in (0.70, 0.77, 0.85):
+            thr = float(np.quantile(pb[is_b], 1 - wp))
+            for bg, code in (("light", 0), ("c", 1)):
+                eff = float(np.mean(pb[fli == code] >= thr))
+                tag[f"rej_{bg}_{int(wp*100)}"] = (1.0 / eff) if eff > 0 else None
+        out["tagging"] = tag
     # headline scalars = isolated population (the trained-on population)
     for k in ("nll", "mae", "pull_std", "jes_closure_rms", "jer_mid"):
         out[k] = out["iso"][k]

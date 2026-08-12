@@ -90,6 +90,9 @@ def make_collate(cfg: JetRegConfig, norm):
         if cfg.flavor_cond:
             f = np.array([it["flavor"] for it in items])
             out["flav"] = torch.eye(3)[torch.from_numpy(f).long()]
+        if cfg.panoptic:
+            out["flav_label"] = torch.from_numpy(
+                np.array([it["flavor"] for it in items])).long()
         return out
 
     return collate
@@ -135,6 +138,9 @@ def main():
                     help="label-efficiency: subsample the train jets")
     ap.add_argument("--flavor-select", choices=["all", "b", "c", "light"],
                     default="all", help="restrict all splits to one flavor")
+    ap.add_argument("--pan-lambda", type=float, default=1.0,
+                    help="panoptic: weight of the regression term "
+                         "(0 = pure tagger baseline)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -145,7 +151,8 @@ def main():
         + ("-pre" if args.pretrained else "") \
         + ("-probe" if args.freeze_encoder else "") \
         + (f"-f{args.train_frac:g}" if args.train_frac < 1 else "") \
-        + ({"b": "-b", "c": "-c", "light": "-l"}.get(args.flavor_select, ""))
+        + ({"b": "-b", "c": "-c", "light": "-l"}.get(args.flavor_select, "")) \
+        + ("-tagonly" if (cfg.panoptic and args.pan_lambda == 0) else "")
     tag = f"{cfg_name}_seed{args.seed}"
     os.makedirs(args.out, exist_ok=True)
 
@@ -215,14 +222,18 @@ def main():
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=max(args.epochs - args.warmup_epochs, 1), eta_min=1e-5)
 
-    def loss_fn(out, y, w, epoch):
-        mu, logv = out[:, 0], out[:, 1].clamp(-8, 8)
+    def loss_fn(out, y, w, epoch, flav=None):
+        o = 3 if cfg.panoptic else 0   # regression outputs offset
+        mu, logv = out[:, o], out[:, o + 1].clamp(-8, 8)
         if epoch < args.warmup_epochs:
             per = F.huber_loss(mu, y, delta=0.3, reduction="none")
         elif args.loss == "mae":
             per = (y - mu).abs()   # median-targeting; sigma gets no gradient
         else:
             per = 0.5 * (logv + (y - mu) ** 2 / logv.exp())
+        if cfg.panoptic:
+            ce = F.cross_entropy(out[:, :3], flav, reduction="none")
+            per = ce + args.pan_lambda * per
         return (per * w).sum() / w.sum()
 
     def run_epoch(dl, epoch, train_mode):
@@ -232,7 +243,8 @@ def main():
             for batch in dl:
                 batch = to_device(batch, dev)
                 out = model(batch)
-                loss = loss_fn(out, batch["y"], batch["w"], epoch)
+                loss = loss_fn(out, batch["y"], batch["w"], epoch,
+                               batch.get("flav_label"))
                 if train_mode:
                     opt.zero_grad()
                     loss.backward()
@@ -264,13 +276,16 @@ def main():
 
     model.load_state_dict(torch.load(ckpt, weights_only=False)["model"])
     model.eval()
-    mus, sigs = [], []
+    mus, sigs, probs = [], [], []
+    o = 3 if cfg.panoptic else 0
     with torch.no_grad():
         for batch in dl_test:
             batch = to_device(batch, dev)
             out = model(batch)
-            mus.append(out[:, 0].cpu().numpy())
-            sigs.append(np.exp(0.5 * out[:, 1].clamp(-8, 8).cpu().numpy()))
+            mus.append(out[:, o].cpu().numpy())
+            sigs.append(np.exp(0.5 * out[:, o + 1].clamp(-8, 8).cpu().numpy()))
+            if cfg.panoptic:
+                probs.append(torch.softmax(out[:, :3], dim=1).cpu().numpy())
     mu = np.concatenate(mus)
     sig = np.concatenate(sigs)
     pred_path = os.path.join(args.out, f"{tag}_pred.npz")
@@ -280,7 +295,8 @@ def main():
         eta=test.arrays["eta_reco"], phi=test.arrays["phi_reco"],
         response=test.arrays["response"],
         iso=(test.arrays["iso_reco"] & test.arrays["iso_truth"]),
-        flavor=test.arrays.get("flavor", np.zeros(len(mu), np.int8)))
+        flavor=test.arrays.get("flavor", np.zeros(len(mu), np.int8)),
+        **({"probs": np.concatenate(probs)} if probs else {}))
 
     from dfm.jetreg.evaluate import prediction_metrics
     metrics = prediction_metrics(pred_path)
