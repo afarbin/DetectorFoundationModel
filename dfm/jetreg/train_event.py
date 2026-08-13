@@ -28,14 +28,21 @@ MET_SCALE = 100.0  # GeV
 OBJ_KEYS = ("tracks", "cells", "cell_edges", "jets", "jet_flavor",
             "truth_jets")
 
+# target inner dtype per ragged key: some shards were written as densified
+# object arrays of BOXED Python floats (~28 B per number instead of 4);
+# rebuilding each event as a dense typed array shrinks them ~7x in RAM
+OBJ_DTYPE = {"tracks": np.float32, "cells": np.float32,
+             "cell_edges": np.int32, "jets": np.float32,
+             "jet_flavor": np.int8, "truth_jets": np.float32}
 
-def as_obj(a):
-    """1-D object array of per-event arrays, even if numpy densified it."""
-    if a.dtype == object and a.ndim == 1:
-        return a
+
+def as_obj(a, dt):
+    """1-D object array of dense per-event arrays of dtype dt, whatever
+    layout (ragged, densified 3-D, or boxed-object elements) numpy pickled.
+    np.asarray is a no-op for elements already dense with the right dtype."""
     out = np.empty(len(a), dtype=object)
     for i in range(len(a)):
-        out[i] = np.asarray(a[i])
+        out[i] = np.asarray(a[i], dtype=dt)
     return out
 
 
@@ -47,7 +54,8 @@ class EventShards(Dataset):
             names = list(z.files) if keys is None else keys
             for k in names:
                 a = z[k]
-                buf.setdefault(k, []).append(as_obj(a) if k in OBJ_KEYS else a)
+                buf.setdefault(k, []).append(
+                    as_obj(a, OBJ_DTYPE[k]) if k in OBJ_KEYS else a)
             z.close()
         self.arrays = {k: np.concatenate(v) for k, v in buf.items()}
         self.n = len(self.arrays["met_true"])
