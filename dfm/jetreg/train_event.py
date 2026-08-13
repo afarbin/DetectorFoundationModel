@@ -40,16 +40,16 @@ def as_obj(a):
 
 
 class EventShards(Dataset):
-    def __init__(self, paths):
-        self.data = []
-        keys = None
+    def __init__(self, paths, keys=None):
+        buf = {}
         for p in paths:
             z = np.load(p, allow_pickle=True)
-            keys = [k for k in z.files]
-            self.data.append({k: (as_obj(z[k]) if k in OBJ_KEYS else z[k])
-                              for k in keys})
-        self.arrays = {k: np.concatenate([d[k] for d in self.data])
-                       for k in keys}
+            names = list(z.files) if keys is None else keys
+            for k in names:
+                a = z[k]
+                buf.setdefault(k, []).append(as_obj(a) if k in OBJ_KEYS else a)
+            z.close()
+        self.arrays = {k: np.concatenate(v) for k, v in buf.items()}
         self.n = len(self.arrays["met_true"])
 
     def __len__(self):
@@ -132,9 +132,16 @@ def main():
     with open(os.path.join(args.data_dir, "manifest.json")) as fh:
         man = json.load(fh)
     shards = [os.path.join(args.data_dir, f["output"]) for f in man["files"]]
-    train = EventShards(shards[:-2])
-    val = EventShards(shards[-2:-1])
-    test = EventShards(shards[-1:])
+    # load only the branches this task/input combination touches: the cell
+    # arrays dominate the decompressed size and must stay out of memory for
+    # tracks-only jobs
+    need = ["tracks", "truth_jets", "met_true", "met_tracks", "met_cells",
+            "met_jets"]
+    if use_cells:
+        need += ["cells", "cell_edges"]
+    train = EventShards(shards[:-2], need)
+    val = EventShards(shards[-2:-1], need)
+    test = EventShards(shards[-1:], need)
     print(f"[{tag}] events: train {len(train)} val {len(val)} test {len(test)}",
           flush=True)
 
@@ -175,7 +182,7 @@ def main():
                     opt.zero_grad(); loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     opt.step()
-                tot += float(loss) * len(batch["met_true"])
+                tot += float(loss.detach()) * len(batch["met_true"])
                 n += len(batch["met_true"])
         return tot / n
 
