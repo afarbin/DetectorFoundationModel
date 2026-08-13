@@ -24,6 +24,7 @@ run_one() {  # task inputs seed gpu outdir
   local task=$1 inp=$2 seed=$3 gpu=$4 out=$5
   local m=$out/${task}_${inp}_seed${seed}_metrics.json
   local attempt
+  rm -f "$m"   # a metrics file may only exist if THIS run produced it
   for attempt in 1 2; do
     echo "[gpu$gpu] $task $inp seed $seed (attempt $attempt)" >> $CHAIN
     CUDA_VISIBLE_DEVICES=$gpu nice -n 10 $PY -m dfm.jetreg.train_event \
@@ -50,15 +51,19 @@ run_one met TC 0 0 $BASE/results_t3 &
 run_one met TC 1 1 $BASE/results_t3 &
 wait
 run_one met TC 2 0 $BASE/results_t3
-n=$(ls $BASE/results_t3/met_*_metrics.json 2>/dev/null | wc -l)
-if [ "$n" -eq 6 ]; then echo "T3_DONE" >> $CHAIN; else echo "T3_INCOMPLETE n=$n" >> $CHAIN; fi
+n3=$(ls $BASE/results_t3/met_*_metrics.json 2>/dev/null | wc -l)
+if [ "$n3" -eq 6 ]; then echo "T3_DONE" >> $CHAIN; else echo "T3_INCOMPLETE n=$n3" >> $CHAIN; fi
 
 # Phase B2: jetfind TC jobs, 2-wide then 1
 run_one jetfind TC 0 0 $BASE/results_t4 &
 run_one jetfind TC 1 1 $BASE/results_t4 &
 wait
 run_one jetfind TC 2 0 $BASE/results_t4
-n=$(ls $BASE/results_t4/jetfind_*_metrics.json 2>/dev/null | wc -l)
-if [ "$n" -eq 6 ]; then echo "T4_DONE" >> $CHAIN; else echo "T4_INCOMPLETE n=$n" >> $CHAIN; fi
+n4=$(ls $BASE/results_t4/jetfind_*_metrics.json 2>/dev/null | wc -l)
+if [ "$n4" -eq 6 ]; then echo "T4_DONE" >> $CHAIN; else echo "T4_INCOMPLETE n=$n4" >> $CHAIN; fi
 
-echo "T34_EVENT_COMPLETE" >> $CHAIN
+if [ "$n3" -eq 6 ] && [ "$n4" -eq 6 ]; then
+  echo "T34_EVENT_COMPLETE" >> $CHAIN
+else
+  echo "T34_EVENT_INCOMPLETE met=$n3 jetfind=$n4" >> $CHAIN
+fi
