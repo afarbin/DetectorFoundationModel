@@ -1,0 +1,14 @@
+config            seeds     eff/resol   fake/base_c    mae/base_j
+jetfind_T             3  eff 0.789+-0.010  fake 0.125+-0.021  logptMAE 0.293+-0.010
+jetfind_TC            3  eff 0.759+-0.052  fake 0.110+-0.016  logptMAE 0.238+-0.015
+met_T                 3  resol_model 49.46+-0.01  (baselines: tracks 60.62 cells 43.22 jets 44.17)
+met_TC                3  resol_model 26.99+-0.10  (baselines: tracks 60.62 cells 43.22 jets 44.17)
+Notes:
+- met_T collapses to constant output (pred std ~0, corr(pred,true) ~0.02);
+  its 'resolution' is the spread of truth MET about a constant.
+- met_TC: 27.0 GeV vs best classical baseline 43.2 (cell sum) = -37%.
+- jetfind efficiency integrals are dominated by the 20-30 GeV turn-on;
+  plateau efficiency (>80 GeV): TC ~0.99, T ~0.95 (offline eval, best seed).
+- jetfind TC seeds trained under torch 2.13 (post-reboot venv rebuild);
+  T seeds under the previous venv. No checkpoints cross versions.
+- v2 OOM incident and recovery: see ops/run_t34_event_v3.sh, _v4.sh headers.
