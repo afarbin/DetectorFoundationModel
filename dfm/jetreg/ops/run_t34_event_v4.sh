@@ -7,7 +7,8 @@
 # redo completed runs.
 set -u
 BASE=/storage/afarbin/jetreg
-PY=/home/afarbin/.virtualenvs/CaloGraphNet/bin/python
+# venv relocated to local /test disk after the Aug 13 home wipe
+PY=/test/afarbin/venvs/CaloGraphNet/bin/python
 DATA=$BASE/event_data
 LOGS=$BASE/logs
 CHAIN=$LOGS/t34_event_chain.log
