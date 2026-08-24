@@ -54,8 +54,21 @@ Task **50733453** (owner Brendon Bullard, run 2026-06-05→09, status done):
   list-dataset-replicas`) needs the renewed cert; the obvious ask to Umar is
   which site hosts it and whether UTA can pull a larger slice — a 10×
   dataset would transform the P6 scaling study and per-bin statistics.
-- A second-process production is now a *precise* request: the same SuperHJD
-  command over a different mc21_14TeV AOD dataset (dijet / Z+jets).
+- **A second process already exists (partially)**: bbullard's task list shows
+  parallel SuperHJD productions of **mc21_14TeV.600026
+  PhH7EG_NNPDF3_AZNLO_VBFH125_ZZ4nu_MET75** (VBF H(125)→ZZ→4ν, MET>75
+  filter — the proposal's VBF H→inv benchmark), tags `e8481_s4290_r15700`
+  (note: different s/r tags than the ttbar — not the same pileup/sim
+  config; a fair-comparison caveat if used together). Status: the full
+  attempts broke/aborted; the surviving task **50789452** (2026-06-08)
+  processed a **50k-event test slice → 10 ntuple files** in container
+  `user.bbullard.mc21_14TeV.600026...20260608_ntuple.root`. The input AOD
+  dataset (4.99M events, tid40102068) exists for a full rerun. Asks to
+  Umar: where are the 10 files, and can the full VBF production be rerun?
+  This converts our "second-process sample" from long-lead to concrete, and
+  gives the MET study a genuine invisible-Higgs signal.
+- A *third* process (dijet / Z+jets) remains a request: the same SuperHJD
+  command over the corresponding mc21_14TeV AOD dataset.
 
 ## CERN trail (checked 2026-08-24, negative)
 
