@@ -301,9 +301,30 @@ def main():
         print(f"  cutflow: {cuts}", flush=True)
         if args.id_map:
             id_map.save(args.id_map)
-    with open(os.path.join(args.out, "manifest.json"), "w") as fh:
+    # unique name so parallel invocations over disjoint file sets don't
+    # clobber each other; merge_manifests() combines them at gate G1
+    stem0 = os.path.basename(args.files[0]).replace(".ntuple.root", "")
+    with open(os.path.join(args.out, f"manifest_{stem0}.json"), "w") as fh:
         json.dump(manifest, fh, indent=2)
     print("done.")
+
+
+def merge_manifests(out_dir):
+    """Combine per-invocation manifests into manifest.json (call at G1)."""
+    parts = sorted(glob.glob(os.path.join(out_dir, "manifest_*.json")))
+    merged = None
+    for p in parts:
+        with open(p) as fh:
+            m = json.load(fh)
+        if merged is None:
+            merged = {k: v for k, v in m.items() if k != "files"}
+            merged["files"] = []
+        merged["files"] += m["files"]
+    if merged:
+        merged["files"].sort(key=lambda f: f["input"])
+        with open(os.path.join(out_dir, "manifest.json"), "w") as fh:
+            json.dump(merged, fh, indent=2)
+    return merged
 
 
 if __name__ == "__main__":
