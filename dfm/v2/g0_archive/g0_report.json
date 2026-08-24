@@ -1,0 +1,11 @@
+{
+  "checked": 60,
+  "reproduced": 60,
+  "failures": [],
+  "figures": [
+    "../g0/figures/G0_coverage.png",
+    "../g0/figures/G0_pull_tails.png",
+    "../g0/figures/G0_sigma_closure.png",
+    "../g0/figures/G0_jer_core.png"
+  ]
+}

@@ -1,0 +1,4 @@
+Empirical coverage of the predicted per-jet Gaussian intervals vs nominal,
+isolated jets. mc21 $\sqrt{s}=14$ TeV $t\bar{t}$ SingleLep (PhPy8EG A14 hdamp258p75), AntiKt4EMTopo, $|\eta|<2.5$, $p_T^{true}>20$ GeV. Perfect calibration lies on the dashed line; points
+below it indicate over-confident (too narrow) predicted uncertainties.
+Binomial errors; test split.

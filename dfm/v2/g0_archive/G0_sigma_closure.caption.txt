@@ -1,0 +1,4 @@
+Predicted (median per-jet sigma) vs observed (IQR/1.349 of y-mu) resolution
+per truth-pT bin, with ratio, isolated jets. mc21 $\sqrt{s}=14$ TeV $t\bar{t}$ SingleLep (PhPy8EG A14 hdamp258p75), AntiKt4EMTopo, $|\eta|<2.5$, $p_T^{true}>20$ GeV. Ratio = 1 everywhere
+means the predicted uncertainties close against realized residuals; the ratio
+panel is the input to the S4 rescaling protocol. Test split.

@@ -1,0 +1,4 @@
+Pull tail fractions P(|z|>k), z=(y-mu)/sigma, isolated jets, against the
+normal expectation (dashed). mc21 $\sqrt{s}=14$ TeV $t\bar{t}$ SingleLep (PhPy8EG A14 hdamp258p75), AntiKt4EMTopo, $|\eta|<2.5$, $p_T^{true}>20$ GeV. Excess at k=2,3 measures non-Gaussian
+residual tails the single-Gaussian head cannot represent (H8 motivation).
+Binomial errors; test split.

@@ -1,0 +1,6 @@
+Gaussian-core JER vs truth pT, isolated jets, with N/S/C fits (dotted) where
+shown. mc21 $\sqrt{s}=14$ TeV $t\bar{t}$ SingleLep (PhPy8EG A14 hdamp258p75), AntiKt4EMTopo, $|\eta|<2.5$, $p_T^{true}>20$ GeV. Iterative mu+-2sigma core fit per bin (ATLAS convention);
+errors ~ res/sqrt(2n). Test split.
+TJC-graph: N=0.00+-0.00 GeV, S=0.860+-0.006 sqrt(GeV), C=0.0617+-0.0012, chi2/ndf=3078.3/5.
+TJC-graph+fc: N=0.00+-0.00 GeV, S=0.830+-0.006 sqrt(GeV), C=0.0643+-0.0012, chi2/ndf=3785.2/5.
+TJC-graph+pan: N=0.00+-0.00 GeV, S=0.871+-0.006 sqrt(GeV), C=0.0634+-0.0012, chi2/ndf=3245.2/5.
