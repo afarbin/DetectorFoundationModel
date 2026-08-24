@@ -27,6 +27,36 @@ Tracks", 2026-08-24, slide 3) and our own inspection of the 17 files.
   tree `analysis`. Samples on server: ttbar and HH→bbττ (3k / 10k events).
 - Generator/simulation details: **unknown — part of the request.**
 
+## RESOLVED via BigPanDA task record (2026-08-24, kerberos query authorized by Amir)
+
+Task **50733453** (owner Brendon Bullard, run 2026-06-05→09, status done):
+
+- **Input**: `mc21_14TeV.601229.PhPy8EG_A14_ttbar_hdamp258p75_SingleLep.recon.AOD.e8481_s4446_r16176`
+  (17 tid sub-datasets, **44,679,000 events**, 446,790 AOD files). DSID 601229 =
+  Powheg+Pythia8 ttbar, A14 tune, hdamp = 1.5 m_top, single-lepton filter.
+- **AMI tags**: `e8481` (evgen) / `s4446` (**full Geant4 simulation**) /
+  `r16176` (digi+reco incl. pileup). Exact generator versions, PDF and μ
+  profile: one AMI lookup on these tags once the grid cert is renewed (or ask
+  production).
+- **This is an HL-LHC / Run-4 upgrade production**: the dumper ran with
+  `SuperHJD.run=RUN4`, geometry tag **ATLAS-P2-RUN4-03-01-00** (Phase-II
+  detector, ITk tracker), √s = 14 TeV — our studies are on the *upgrade*
+  detector, which every note's detector section must now say.
+- **Dumper**: package `SuperHJD`, Athena **25.0.62** (`x86_64-el9-gcc14-opt`,
+  AlmaLinux9 container), exact command:
+  `python -m SuperHJD.run --filesInput=%IN SuperHJD.run=RUN4
+  SuperHJD.getVerticesTracks=True SuperHJD.getCellsInfo=True
+  SuperHJD.getTruthParticles=True SuperHJD.geometryTag=ATLAS-P2-RUN4-03-01-00`
+  → ask Umar for the SuperHJD repo/tag to close the object-definition items.
+- **Output container**: `user.bbullard.mc21_14TeV.601229.PhPy8EG_A14_ttbar_hdamp258p75_SingleLep.ntuple.e8481_s4446_r16176.20260604_ntuple.root`
+  — ~2,930 files. **UTA's 17 files ≈ 0.6% of the production** (~340k of
+  44.7M events; full set ≈ 17 TB). Locating replicas (`rucio
+  list-dataset-replicas`) needs the renewed cert; the obvious ask to Umar is
+  which site hosts it and whether UTA can pull a larger slice — a 10×
+  dataset would transform the P6 scaling study and per-bin statistics.
+- A second-process production is now a *precise* request: the same SuperHJD
+  command over a different mc21_14TeV AOD dataset (dijet / Z+jets).
+
 ## CERN trail (checked 2026-08-24, negative)
 
 Searched from lxplus with kerberos (no grid cert available — the `~/.globus`
