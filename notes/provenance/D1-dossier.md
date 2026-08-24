@@ -27,6 +27,20 @@ Tracks", 2026-08-24, slide 3) and our own inspection of the 17 files.
   tree `analysis`. Samples on server: ttbar and HH→bbττ (3k / 10k events).
 - Generator/simulation details: **unknown — part of the request.**
 
+## CERN trail (checked 2026-08-24, negative)
+
+Searched from lxplus with kerberos (no grid cert available — the `~/.globus`
+cert expired 2008 and belongs to another user; renewal via ca.cern.ch is on
+Amir): the 17 files are **not** on CERN EOS (deterministic rucio hash paths
+probed on `atlasscratchdisk` and `atlasdatadisk`); bbullard's rucio areas
+there are empty (deleted-dataset husks); a full scratchdisk walk found zero
+files; CERNBox unreadable; no provenance metadata embedded in the ntuples.
+Conclusion: replicas live at SLAC (and UTA) only. The one untapped
+kerberos-reachable source is the PanDA task record — task id **50733453**
+from the filenames; `https://bigpanda.cern.ch/task/50733453/` (CERN SSO)
+lists the input DAOD dataset name, whose AMI tags encode generator versions,
+sim chain, and pileup — most of the request below in one page.
+
 ## What we still need (the request)
 
 | Item | 5D (Umar/SLAC) | Calo (Mohammadali) |
