@@ -27,6 +27,9 @@ for `DATASHEET.md`; feature choices in the v2 builder cite this file.*
 - **`AntiKt4EMTopoJets_GN2_{pb,pc,pu,Db}` — all zero.** No production-tagger
   baseline in this dump. Ask: can a rerun fill GN2 (or was it absent from
   the Run-4 AODs)?
+- **`AntiKt4EMTopoJets_btagTrack_idx` — empty for every jet** (verified 716
+  jets): the b-tagging track association was not filled; ghost association
+  is the only track-jet association available.
 - **`Track_truthPart_idx` / `Track_truthProb`** — truthPart_idx present
   (unverified fill), but **`Track_truthVtx_idx` is −1 everywhere**: no
   track-to-truth-vertex association; multi-vertex *truth* supervision is
