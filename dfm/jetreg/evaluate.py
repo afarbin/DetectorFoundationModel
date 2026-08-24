@@ -158,6 +158,19 @@ def aggregate(results_dir):
         by_cfg.setdefault(m["config"], []).append(m)
     lines = [f"{'config':<14}{'seeds':>6}{'NLL':>9}{'MAE':>9}"
              f"{'closRMS':>9}{'JER@65':>8}{'JERunc':>8}{'pull':>7}{'min/run':>8}"]
+    # baseline: the uncorrected calo-jet response of the dataset's main iso
+    # population (the profile shared by the most configs — per-flavor
+    # dedicated models evaluate on flavor subsets and keep their own JERunc)
+    profiles = {}
+    for m in rows:
+        key = json.dumps(m["iso"]["med_uncorr"])
+        profiles.setdefault(key, []).append(m)
+    base = max(profiles.values(), key=len)[0]["iso"]
+    med_u = np.array(base["med_uncorr"], dtype=float)
+    clos_u = float(np.sqrt(np.nanmean((med_u[BULK] - 1.0) ** 2)))
+    jer_u = base["jer_mid_uncorr"]
+    lines.append(f"{'uncorrected':<14}{'-':>6}{'-':>9}{'-':>9}"
+                 f"{clos_u:>9.4f}{jer_u:>8.4f}{jer_u:>8.4f}{'-':>7}{'-':>8}")
     for cfg, ms in sorted(by_cfg.items()):
         def agg(k):
             v = [m[k] for m in ms if m.get(k) is not None]
