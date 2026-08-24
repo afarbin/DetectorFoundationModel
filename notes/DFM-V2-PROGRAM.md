@@ -286,10 +286,22 @@ Calo ntuples: full-granularity 187,652-cell events with topocluster truth —
 ttbar (~1k processed; more raw on disk) and **HH→bbττ (3k + 10k events)**.
 `cell_matching.py` bridges the formats exactly.
 
+*Branch verification done 2026-08-24
+(`notes/provenance/branch-inventory.md`): the 17 files are far richer than
+v1 used — cell time/quality/noise-split (~80% filled), track timing
+(HGTD-era, 39.6% of tracks), track→calo-layer extrapolations, truth
+HS-vertex time, in/out-of-time pileup truth jets, extended flavor labels.
+Empty stubs: GN2 tagger scores (all zero), track→truth-vertex links.*
+
 **Achievable now**
 - The whole per-jet program: modality ladder, probabilistic heads,
-  flavor/gluon splits, full uncertainty validation, HPO, label efficiency.
+  flavor splits (gluon via TruthPart parton matching in the builder), full
+  uncertainty validation, HPO, label efficiency.
 - Event-level: MET-from-subsets, DETR jet finding, the ΔR context-gain study.
+- **Timing-aware features** (cell time/quality, partial track time, truth
+  vertex time) — moved up from "blocked".
+- **Pileup-jet discrimination** (HS vs in-time vs out-of-time PU truth jets)
+  — a new candidate task, fully supported by the data.
 - Foundation claims: masked pretraining, linear probes, label-efficiency
   curves, parameter-efficient heads, multi-task non-regression.
 - **Cross-process transfer of the calo encoder** (ttbar → HH→bbττ, Calo side).
@@ -297,21 +309,29 @@ ttbar (~1k processed; more raw on disk) and **HH→bbττ (3k + 10k events)**.
 
 **Achievable with reprocessing of data already on disk**
 - Larger full-granularity Calo processing (raw events exist beyond the ~1k).
-- Cell-timing-aware studies, if the time branches in our 17 files match
-  Umar's (verify in P1).
-- Gluon/tau splits, if the parton-label branch is present (verify in P1).
 
 **Blocked pending external input** (flag now, in writing)
 - Same-event cells+tracks at full granularity → needs a combined ntuplizer
   production (the long-lead request; until then, cell claims carry the
   thinned-subset caveat).
-- Sample-dependence of the calibration → needs a second-process 5D sample
-  (dijet or Z+jets); interim: μ- and topology-binned splits within ttbar.
+- Sample-dependence of the calibration → a VBF H→inv SuperHJD test slice
+  (50k events) exists at SLAC and its 5M-event AOD is rerunnable
+  (`notes/provenance/D1-dossier.md`); transfer requested via
+  `SLAC-transfer-request.md`. A dijet/Z+jets production remains a request.
+  Interim: μ- and topology-binned splits within ttbar.
 - True reco-MET comparison → needs soft-term/full-cell MET branches.
-- Remaining provenance (pileup profile, sim chain, derivation cuts) → D1.
-- Proposal benchmarks out of scope for now: VBF H→inv, HH→4b (5D side),
-  multi-vertex inference, timing-aware reconstruction beyond cell-time
-  features.
+- Provenance: **largely resolved via the BigPanDA task record** (HL-LHC
+  Run-4 samples — mc21_14TeV, full G4 sim, geometry ATLAS-P2-RUN4-03-01-00,
+  SuperHJD dumper in Athena 25.0.62); remaining: AMI decode of
+  e8481/s4446/r16176 (pileup profile, generator versions — needs the renewed
+  grid cert) and the SuperHJD source.
+- GN2 production-tagger baseline → needs a rerun with the scores filled
+  (branches exist but are all zero).
+- Multi-vertex inference → only the HS truth vertex is stored and
+  track→truth-vertex links are empty; reco-vertex *grouping* (per-track
+  indices) is available, full multi-vertex truth is not.
+- Proposal benchmarks still out of scope: HH→4b (5D side); VBF H→inv is
+  *partially* unblocked (50k-event test slice + rerunnable AOD — see above).
 
 ## 6. Compute and effort
 
