@@ -17,7 +17,7 @@ for `DATASHEET.md`; feature choices in the v2 builder cite this file.*
 | Full track covariance | `Track_cov_*` (10), `Track_var_*` (5) | filled; v1 derived IP significances from these |
 | Reco-vertex grouping | `Track_recoVtx_idx` (up to ~130 vtx/event), `Track_recoVtx_weight` | filled; **no RecoVtx_* collection branches** (positions not dumped) — grouping only |
 | Truth HS vertex + time | `TruthVtx_{x,y,z,time,isHS,track_idx}` | **one vertex/event (HS only)**, time filled |
-| Truth particles | `TruthPart_{pt,eta,phi,m,pdgId,charge,prodVtx_*}` | filled; neutrino-sum truth MET confirmed; **parton (gluon) labels derivable** by jet–parton matching on pdgId — no dedicated branch |
+| Truth particles | `TruthPart_{pt,eta,phi,m,pdgId,charge,prodVtx_*}` | filled — **full stable-final-state record, ~145/event** (π, γ, K, p, n, leptons, ν; verified 500 events): neutrino-sum truth MET confirmed, truth-constituent targets possible. **No partons (pdgId 21 or 1–5 absent) → gluon labels NOT derivable**; ask Umar how his slides' gluon split was labeled |
 | Pileup truth jets | `TruthITPUJet_*` (~20/evt), `TruthOOTPUJet_*` (~41/evt), `TruthHSJet_*` | filled → **HS-vs-pileup jet discrimination is a live task** (with `AntiKt4EMTopoJets_isHS`, `truthHSJet_idx`, `truthITPUJet_idx`, `truthOOTPUJet_idx`) |
 | Extended flavor labels | `HadronConeExclExtendedTruthLabelID` | filled (values incl. 44/55 double-c/b, 15 tau) |
 | Jet substructure inputs | `constituentPt/Eta/Phi`, `width`, `btagTrack_idx`, `matchedTruth_dR/GhostFrac` | filled |
@@ -44,8 +44,9 @@ for `DATASHEET.md`; feature choices in the v2 builder cite this file.*
    cell time/quality + 40%-coverage track time + truth HS vertex time.
 2. **New candidate task**: pileup-jet discrimination (HS vs ITPU vs OOTPU) —
    directly the proposal's pileup narrative; data fully in hand.
-3. Gluon split: **derivable in the v2 builder** (TruthPart pdgId matching),
-   no reprocessing needed.
+3. Gluon split: **not derivable** — TruthPart holds stable particles only,
+   no partons. Goes on the Umar ask list (how were his slides labeled? a
+   parton branch in newer SuperNtuples, or SLAC-side derivation?).
 4. GN2 comparison: **not possible with current files** — stays on the Umar
    ask list.
 5. The v2 feature schema should adopt: cell time/quality/noise-split/region

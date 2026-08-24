@@ -295,8 +295,8 @@ Empty stubs: GN2 tagger scores (all zero), track→truth-vertex links.*
 
 **Achievable now**
 - The whole per-jet program: modality ladder, probabilistic heads,
-  flavor splits (gluon via TruthPart parton matching in the builder), full
-  uncertainty validation, HPO, label efficiency.
+  flavor splits (b/c/light + extended double-b/c labels; **no gluon** — see
+  blocked), full uncertainty validation, HPO, label efficiency.
 - Event-level: MET-from-subsets, DETR jet finding, the ΔR context-gain study.
 - **Timing-aware features** (cell time/quality, partial track time, truth
   vertex time) — moved up from "blocked".
@@ -327,6 +327,9 @@ Empty stubs: GN2 tagger scores (all zero), track→truth-vertex links.*
   grid cert) and the SuperHJD source.
 - GN2 production-tagger baseline → needs a rerun with the scores filled
   (branches exist but are all zero).
+- Gluon-jet labels → TruthPart is stable-final-state only (no partons);
+  needs a parton-label branch or SLAC-side labeling (Umar's slides have a
+  gluon split — ask how).
 - Multi-vertex inference → only the HS truth vertex is stored and
   track→truth-vertex links are empty; reco-vertex *grouping* (per-track
   indices) is available, full multi-vertex truth is not.
