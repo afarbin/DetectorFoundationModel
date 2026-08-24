@@ -64,6 +64,14 @@ at training time, not build time) so tagging studies can use them.
 4. Datasheet (`DATASHEET.md`) with per-split/per-flavor/per-bin counts and
    the QA figure set (occupancy, thinning bias vs η/layer, response spectra
    by flavor/pT/η/μ, truth-match purity, μ profile).
+   Added after Ariel's review (2026-08-25):
+   - **Truth-jet constituent test**: TruthHSJet_pt vs ΔR-cone vector sum of
+     TruthPart with and without ν/μ — decides whether particle jets include
+     the neutrino (gates the H8 interpretation).
+   - **Electron-overlap check**: rate of kept jets with a TruthPart
+     electron (pT > 10 GeV) within ΔR < 0.2; veto if non-negligible.
+   - Reporting: MPV alongside median; headline bins start at 30 GeV
+     (20–30 diagnostic-only).
 5. Rebuild is deterministic: same inputs → byte-identical manifests.
 
 ## Planned figures

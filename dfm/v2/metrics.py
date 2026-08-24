@@ -31,6 +31,12 @@ PT_EDGES = np.array([20, 30, 45, 65, 90, 125, 175, 250, 400], dtype=float)
 ETA_EDGES = np.array([0.0, 0.6, 1.0, 1.37, 1.52, 2.0, 2.5])
 BULK = slice(0, 7)
 
+# HL-LHC reporting convention (Ariel review, 2026-08-25): calibration starts
+# at 30 GeV — headline bins begin there; 20-30 is diagnostic-only (it is
+# also the reco-floor-clipped bin). Legacy PT_EDGES stays for the v1
+# reproduction contract.
+PT_EDGES_REPORT = np.array([30, 45, 65, 90, 125, 175, 250, 400], dtype=float)
+
 NORMAL_TAILS = {1: 0.31731, 2: 0.04550, 3: 0.00270}   # P(|z|>k), N(0,1)
 # std of a unit normal truncated at +-2 sigma (used by the moment fallback)
 _TRUNC2_STD = 0.87962
@@ -100,9 +106,11 @@ def gaussian_core(x, max_iter=50, window=2.0, tol=1e-5):
         mu, sig = mu_new, max(sig_new, 1e-9)
     res = sig / mu if mu else np.nan
     err = res / np.sqrt(max(2 * (n_win - 1), 1)) if n_win > 1 else np.nan
-    return dict(mu=float(mu), sigma=float(sig), res=float(res),
-                err_res=float(err), n=len(x), n_window=n_win,
-                converged=bool(converged))
+    # mpv: the Gaussian-core mu IS the most-probable value — the response
+    # figure of merit per the Ariel review (median kept as robust cross-check)
+    return dict(mu=float(mu), mpv=float(mu), sigma=float(sig),
+                res=float(res), err_res=float(err), n=len(x),
+                n_window=n_win, converged=bool(converged))
 
 
 def core_stats(resp, var, edges=PT_EDGES):
@@ -142,8 +150,14 @@ def nsc_fit(edges, res, err):
     perr = np.sqrt(np.diag(pcov))
     chi2 = float(np.sum(((res[ok] - f(pt[ok], *popt)) / err[ok]) ** 2))
     ndf = int(ok.sum() - 3)
+    # parameter correlations: N/S/C are strongly correlated — present them
+    # with the values, and frame N/S/C interpretations as preliminary
+    with np.errstate(invalid="ignore", divide="ignore"):
+        corr = pcov / np.outer(perr, perr)
     return dict(N=float(popt[0]), S=float(popt[1]), C=float(popt[2]),
                 err_N=float(perr[0]), err_S=float(perr[1]), err_C=float(perr[2]),
+                corr_NS=float(corr[0, 1]), corr_NC=float(corr[0, 2]),
+                corr_SC=float(corr[1, 2]),
                 chi2=chi2, ndf=ndf, pt=pt[ok].tolist(),
                 fitted=f(pt[ok], *popt).tolist())
 
@@ -270,14 +284,14 @@ def population_report(y, mu, sig, resp, pt_true, eta=None):
         jer_mid_uncorr=float(jer_0[3]) if np.isfinite(jer_0[3]) else None,
     )
 
-    # ATLAS-convention block
-    core_c = core_stats(r_corr, pt_true)
-    core_0 = core_stats(resp, pt_true)
-    core_incl = gaussian_core(r_corr)
-    core_incl_unc = gaussian_core(resp)
-    nsc_c = nsc_fit(PT_EDGES, [c["res"] for c in core_c],
+    # ATLAS-convention block: HL-LHC reporting bins (30 GeV floor)
+    core_c = core_stats(r_corr, pt_true, edges=PT_EDGES_REPORT)
+    core_0 = core_stats(resp, pt_true, edges=PT_EDGES_REPORT)
+    core_incl = gaussian_core(r_corr[pt_true >= 30])
+    core_incl_unc = gaussian_core(resp[pt_true >= 30])
+    nsc_c = nsc_fit(PT_EDGES_REPORT, [c["res"] for c in core_c],
                     [c["err_res"] for c in core_c])
-    nsc_0 = nsc_fit(PT_EDGES, [c["res"] for c in core_0],
+    nsc_0 = nsc_fit(PT_EDGES_REPORT, [c["res"] for c in core_0],
                     [c["err_res"] for c in core_0])
 
     # S4 block
@@ -300,11 +314,12 @@ def population_report(y, mu, sig, resp, pt_true, eta=None):
     return dict(
         legacy=legacy,
         core=dict(
+            edges=PT_EDGES_REPORT.tolist(),
             inclusive=core_incl, inclusive_uncorr=core_incl_unc,
-            med=[c["mu"] for c in core_c], res=[c["res"] for c in core_c],
+            mpv=[c["mpv"] for c in core_c], res=[c["res"] for c in core_c],
             err_res=[c["err_res"] for c in core_c],
             res_uncorr=[c["res"] for c in core_0],
-            n_bin=nbin.tolist(),
+            n_bin=[c["n"] for c in core_c],
         ),
         nsc=nsc_c, nsc_uncorr=nsc_0,
         s4=s4,

@@ -87,7 +87,7 @@ def main():
             F.coverage_diagram(cov, fig_dir, "G0_coverage"),
             F.pull_tail_plot(tails, fig_dir, "G0_pull_tails"),
             F.sigma_closure_plot(clos, M.PT_EDGES, fig_dir, "G0_sigma_closure"),
-            F.jer_vs_pt(core, M.PT_EDGES, fig_dir, "G0_jer_core",
+            F.jer_vs_pt(core, M.PT_EDGES_REPORT, fig_dir, "G0_jer_core",
                         nsc_by_model=nsc),
         ]
 

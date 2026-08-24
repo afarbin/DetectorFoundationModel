@@ -30,6 +30,18 @@ for panoptic reconstruction tasks, benchmarked against classical chains. The
 program below builds exactly that, and §5 states honestly which proposal
 claims our current data can and cannot support.
 
+**Physics stance** (adopted from Ariel's review, 2026-08-25 —
+`reviews/ariel_comments_actions.md`): the jet-energy work is framed not as
+"a new ML calibration" but as addressing the *sources of hadronic shower
+fluctuations that limit JER*, via a **global correction** that compensates
+all effects simultaneously — avoiding particle-flow's per-constituent
+confusion term — as the modern extension of the Global Sequential
+Calibration, complementary to p-flow. Corrections are strictly to
+*particle* (truth-jet) level; parton-level/out-of-cone effects are
+process-dependent physics, not calibration. Reporting conventions: MPV
+(Gaussian-core μ) as the response figure of merit; HL-LHC binning from
+30 GeV.
+
 ---
 
 ## 1. The protocol (applies to every step)
@@ -158,7 +170,11 @@ convention) adopted as a standard sanity figure.
 ### Phase 3 — Per-jet calibration, re-validated (weeks 3–6)
 
 **Build.** The modality ladder re-run under protocol: C, T, TJ, TC, TJC ×
-{graph, set} — 10 seeds on headline configs. Two target parameterizations:
+{graph, set} — 10 seeds on headline configs — plus the **feature-ablation
+ladder** (Ariel): baseline = jet (pT, η, φ) only, then physics-motivated
+group additions (GSC-like engineered → track relatives → cells → hit
+counts → timing), each step's ΔJER with CIs, separating physics-motivated
+gains from kitchen-sink regression. Two target parameterizations:
 (a) correction to the calo jet (deployable, v1's choice), and (b)
 **constituents-only absolute pT** — the honest measurement of standalone
 information content that v1 lacked and that the "tracks alone" question
@@ -172,9 +188,15 @@ TC↔TJC gap?).
 flavor. Epistemic term via MC dropout.
 
 **Visualize.** Ladder tables (baseline rows first), JER vs pT/η with
-Gaussian-core fit panels, N/S/C decomposition per config, coverage diagrams,
-mixture-component anatomy vs pT (does one component isolate semileptonic
-b's?), gluon split.
+Gaussian-core fit panels (response grids in pT×η with example fits,
+same-axes discipline), N/S/C decomposition per config with parameter
+correlations shown, coverage diagrams, mixture-component anatomy vs pT
+(does one component isolate semileptonic b's?), response vs N_PV and
+HS/PU-track multiplicity. **Failure-mode analysis**: event displays and
+feature distributions for jets with the largest/smallest corrections —
+the topocluster-threshold boundary mechanism (a second particle reaching a
+seeded cluster keeps all its energy; alone it fails 4/2, worst at the jet
+edge) is the first pattern to look for.
 
 **Document.** Note 01-v2 (calibration) and Note 04 (probabilistic heads — the
 flagship, mirroring PHYS-018 on our backbone).

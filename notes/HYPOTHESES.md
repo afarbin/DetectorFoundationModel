@@ -20,7 +20,7 @@ same-jets uncorrected baseline of the same population and estimator.
 | H5 | Learned MET (tracks+cells) beats best classical sum by ≥30% | v2: ≥30% resolution improvement vs the Phase-2 classical baselines, 10 seeds (v1: 37%) (proposed) | P5 |
 | H6 | DETR finder: eff ≥ 0.97 (TC), fake ≤ 0.15, and TC > T | With the stability program: seed sd of efficiency < 0.02, else the claim is "unstable" regardless of mean (proposed) | P5 |
 | H7 | Pretraining: marginal at 100% labels; positive at 1% | At 1% labels: pretrained beats scratch by ≥5% relative JER with 95% CI excluding zero across 10 seeds; at 100%: report, no claim. Transfer (ttbar→HH bbττ probe): pretrained probe beats random-init probe by 95% CI (proposed) | P4 |
-| H8 | b-response bimodality: a mixture component isolates semileptonic b's | MoG (best K) reduces b-jet P(\|z\|>2) toward normal by ≥half the single-Gaussian excess AND one component's weight correlates with the soft-muon/displaced-track signature (proposed) | P3 |
+| H8 | b-response bimodality: a mixture component isolates semileptonic b's | MoG (best K) reduces b-jet P(\|z\|>2) toward normal by ≥half the single-Gaussian excess AND one component's weight correlates with the soft-muon/displaced-track signature (proposed). **Caveat (Ariel, 2026-08-25)**: the mechanism reading depends on whether truth jets include the ν/μ — measured empirically in the G1 QA (TruthHSJet_pt vs TruthPart cone sums ±ν/μ) before H8 is interpreted | P3 |
 
 ## Known-in-advance diagnostics (from the G0 retro-analysis of v1)
 
