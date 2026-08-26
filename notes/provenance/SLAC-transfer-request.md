@@ -50,14 +50,13 @@ Amir before going beyond).
   counts and sizes against the PanDA record.
 - If lying around: the prun log tarballs for tasks 50733453 / 50789452.
 
-## Two questions for you (Mohammadali)
+## Answered / remaining questions (updated 2026-08-26)
 
-1. What are the actual SLAC filesystem paths of the two containers (e.g.
-   under `/sdf/data/...` or group space)? The script takes them as
-   arguments.
-2. Is the data visible on the jump/login node's filesystem, or only from an
-   interior interactive node? The script supports both (set `INNER` for the
-   two-hop case).
+- The data is **not visible from the login node** (per Amir) → `INNER`
+  is required; the script tunnels through the login node to the interior
+  node via ProxyJump (login node only forwards bytes, stores nothing).
+- Container paths on S3DF: Mohammadali locates them (container names are in
+  the email; Umar knows if not findable).
 
 ## How to run (summary; full usage in the script header)
 

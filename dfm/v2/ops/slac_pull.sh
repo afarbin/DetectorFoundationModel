@@ -28,8 +28,10 @@ set -euo pipefail
 # ---- config (edit me) -------------------------------------------------------
 SLAC_USER="${SLAC_USER:-mxg1065}"          # your SLAC S3DF username
 JUMP="${JUMP:-s3dflogin.slac.stanford.edu}"
-INNER="${INNER:-}"                          # interior node if data not visible
-                                            # on the jump host (else leave "")
+INNER="${INNER:-}"                          # interior node — REQUIRED for the
+                                            # SuperHJD data (not visible from
+                                            # the login node); set to the
+                                            # interactive node you use
 DEST_BASE="${DEST_BASE:-/storage/mxg1065/superhjd}"
 RETRIES=5
 CM_SOCK="$HOME/.ssh/cm-slac-%r@%h:%p"
